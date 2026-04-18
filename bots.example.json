@@ -1,0 +1,53 @@
+{
+  "feishuBots": [
+    {
+      "name": "project-alpha",
+      "description": "Frontend development agent for Project Alpha — React, TypeScript, CSS",
+      "specialties": ["frontend", "react", "typescript", "css"],
+      "icon": "🎨",
+      "maxConcurrentTasks": 3,
+      "budgetLimitDaily": 5.0,
+      "ttsVoice": "zh_male_rap_mars_bigtts",
+      "feishuAppId": "cli_xxx",
+      "feishuAppSecret": "secret1",
+      "defaultWorkingDirectory": "/home/user/project-alpha"
+    },
+    {
+      "name": "project-beta",
+      "description": "Backend API development agent for Project Beta",
+      "specialties": ["backend", "api", "database"],
+      "feishuAppId": "cli_yyy",
+      "feishuAppSecret": "secret2",
+      "defaultWorkingDirectory": "/home/user/project-beta",
+      "maxTurns": 30,
+      "maxBudgetUsd": 0.5
+    }
+  ],
+  "telegramBots": [
+    {
+      "name": "tg-project",
+      "description": "General purpose project assistant via Telegram",
+      "telegramBotToken": "123456:ABC-DEF...",
+      "defaultWorkingDirectory": "/home/user/project"
+    }
+  ],
+  "wechatBots": [
+    {
+      "name": "wechat-assistant",
+      "description": "WeChat AI assistant via iLink",
+      "defaultWorkingDirectory": "/home/user/project"
+    }
+  ],
+  "peers": [
+    {
+      "name": "alice",
+      "url": "http://localhost:9200",
+      "secret": "alice-api-secret"
+    },
+    {
+      "name": "remote-team",
+      "url": "http://remote-server:9100",
+      "secret": "remote-api-secret"
+    }
+  ]
+}

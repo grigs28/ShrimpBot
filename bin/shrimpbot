@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# shrimpbot - ShrimpBot management CLI
+# Usage: shrimpbot update | start | stop | restart | logs | status
+
+set -euo pipefail
+
+SHRIMPBOT_HOME="${SHRIMPBOT_HOME:-$HOME/shrimpbot}"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+info()    { echo -e "${BLUE}[INFO]${NC} $*"; }
+success() { echo -e "${GREEN}[OK]${NC} $*"; }
+error()   { echo -e "${RED}[ERROR]${NC} $*"; }
+
+cmd_update() {
+  if [[ ! -d "$SHRIMPBOT_HOME/.git" ]]; then
+    error "ShrimpBot not found at $SHRIMPBOT_HOME"
+    echo "  Run the installer first: curl -fsSL https://raw.githubusercontent.com/xvirobotics/shrimpbot/main/install.sh | bash"
+    exit 1
+  fi
+
+  # Always re-exec from the repo copy before doing anything.
+  # This prevents the running script (e.g. ~/.local/bin/shrimpbot) from being
+  # overwritten mid-execution when we copy CLI tools later.
+  if [[ -z "${SHRIMPBOT_REEXEC:-}" ]] && [[ -f "$SHRIMPBOT_HOME/bin/shrimpbot" ]]; then
+    export SHRIMPBOT_REEXEC=1
+    exec "$SHRIMPBOT_HOME/bin/shrimpbot" update
+  fi
+
+  info "Pulling latest code..."
+  cd "$SHRIMPBOT_HOME"
+  local old_head
+  old_head="$(git rev-parse HEAD)"
+  git pull --ff-only || { error "git pull failed"; exit 1; }
+
+  # Re-exec if git pull updated this script (the repo copy we're running from)
+  if ! git diff --quiet "$old_head" HEAD -- bin/shrimpbot 2>/dev/null; then
+    info "shrimpbot CLI updated, re-launching with new version..."
+    exec "$SHRIMPBOT_HOME/bin/shrimpbot" update
+  fi
+
+  info "Installing dependencies..."
+  npm install --production=false
+
+  info "Building..."
+  npm run build
+
+  # Update CLI tools in ~/.local/bin
+  LOCAL_BIN="$HOME/.local/bin"
+  if [[ -d "$LOCAL_BIN" ]]; then
+    info "Updating CLI tools..."
+    for cli in mb mm shrimpbot; do
+      if [[ -f "$SHRIMPBOT_HOME/bin/$cli" ]]; then
+        cp "$SHRIMPBOT_HOME/bin/$cli" "$LOCAL_BIN/$cli"
+        chmod +x "$LOCAL_BIN/$cli"
+      fi
+    done
+    success "CLI tools updated"
+  fi
+
+  # Update skills in ~/.claude/skills
+  SKILLS_DIR="$HOME/.claude/skills"
+  mkdir -p "$SKILLS_DIR"
+  info "Updating skills..."
+  local src=""
+  for skill in metaskill metamemory shrimpbot voice skill-hub; do
+    case "$skill" in
+      metaskill)  src="$SHRIMPBOT_HOME/src/skills/metaskill" ;;
+      metamemory) src="$SHRIMPBOT_HOME/src/memory/skill" ;;
+      shrimpbot)    src="$SHRIMPBOT_HOME/src/skills/shrimpbot" ;;
+      voice)      src="$SHRIMPBOT_HOME/src/skills/voice" ;;
+      skill-hub)  src="$SHRIMPBOT_HOME/src/skills/skill-hub" ;;
+      *)          src="" ;;
+    esac
+    if [[ -n "$src" && -d "$src" ]]; then
+      mkdir -p "$SKILLS_DIR/$skill"
+      cp -r "$src/." "$SKILLS_DIR/$skill/"
+    fi
+  done
+  # Clean up legacy feishu-doc skill
+  if [[ -d "$SKILLS_DIR/feishu-doc" ]]; then
+    rm -rf "$SKILLS_DIR/feishu-doc"
+    info "Removed legacy feishu-doc skill"
+  fi
+
+  # Update lark-cli skills only if previously installed (opt-in via install.sh)
+  local has_lark_skills=false
+  if [[ -d "$SKILLS_DIR/lark-doc" ]]; then
+    has_lark_skills=true
+  fi
+  success "Skills updated"
+
+  # Update workspace skills if bots.json exists
+  if [[ -f "$SHRIMPBOT_HOME/bots.json" ]] && command -v node &>/dev/null; then
+    local work_dir
+    work_dir=$(node -e "
+      const c=JSON.parse(require('fs').readFileSync('$SHRIMPBOT_HOME/bots.json','utf-8'));
+      const b=[...(c.feishuBots||[]),...(c.telegramBots||[]),...(c.wechatBots||[])];
+      if(b[0])console.log(b[0].defaultWorkingDirectory);
+    " 2>/dev/null || true)
+    if [[ -n "$work_dir" ]]; then
+      local ws_skills_dir="$work_dir/.claude/skills"
+      mkdir -p "$ws_skills_dir"
+
+      # Copy common skills
+      for skill in metaskill metamemory shrimpbot voice skill-hub; do
+        if [[ -d "$SKILLS_DIR/$skill" ]]; then
+          mkdir -p "$ws_skills_dir/$skill"
+          cp -r "$SKILLS_DIR/$skill/." "$ws_skills_dir/$skill/"
+        fi
+      done
+      # Copy lark-cli skills if previously installed
+      if [[ "$has_lark_skills" == "true" ]]; then
+        for lark_skill in lark-base lark-calendar lark-contact lark-doc lark-drive lark-event lark-im lark-mail lark-minutes lark-openapi-explorer lark-shared lark-sheets lark-skill-maker lark-task lark-vc lark-whiteboard lark-wiki lark-workflow-meeting-summary lark-workflow-standup-report; do
+          if [[ -d "$SKILLS_DIR/$lark_skill" ]]; then
+            mkdir -p "$ws_skills_dir/$lark_skill"
+            cp -r "$SKILLS_DIR/$lark_skill/." "$ws_skills_dir/$lark_skill/"
+          fi
+        done
+      fi
+      # Clean up legacy feishu-doc in workspace
+      if [[ -d "$ws_skills_dir/feishu-doc" ]]; then
+        rm -rf "$ws_skills_dir/feishu-doc"
+      fi
+      # Update CLAUDE.md
+      if [[ -f "$SHRIMPBOT_HOME/src/workspace/CLAUDE.md" ]]; then
+        cp "$SHRIMPBOT_HOME/src/workspace/CLAUDE.md" "$work_dir/CLAUDE.md"
+      fi
+      success "Workspace skills updated"
+    fi
+  fi
+
+  info "Restarting ShrimpBot..."
+  pm2 restart shrimpbot 2>/dev/null || pm2 start ecosystem.config.cjs
+  pm2 save --force 2>/dev/null || true
+
+  success "ShrimpBot updated and restarted!"
+}
+
+cmd_start()   { pm2 start "$SHRIMPBOT_HOME/ecosystem.config.cjs"; pm2 save --force 2>/dev/null || true; }
+cmd_stop()    { pm2 stop shrimpbot; }
+cmd_restart() { pm2 restart shrimpbot; }
+cmd_logs()    { pm2 logs shrimpbot "${@}"; }
+cmd_status()  { pm2 describe shrimpbot; }
+
+case "${1:-help}" in
+  update|up)    cmd_update ;;
+  start)        cmd_start ;;
+  stop)         cmd_stop ;;
+  restart|rs)   cmd_restart ;;
+  logs|log)     shift; cmd_logs "$@" ;;
+  status|st)    cmd_status ;;
+  *)
+    echo -e "${BOLD}shrimpbot${NC} - ShrimpBot management CLI"
+    echo ""
+    echo "  shrimpbot update     Pull latest, rebuild, and restart"
+    echo "  shrimpbot start      Start ShrimpBot with PM2"
+    echo "  shrimpbot stop       Stop ShrimpBot"
+    echo "  shrimpbot restart    Restart ShrimpBot"
+    echo "  shrimpbot logs       View live logs (pass -n 100 etc.)"
+    echo "  shrimpbot status     Show PM2 process status"
+    ;;
+esac
