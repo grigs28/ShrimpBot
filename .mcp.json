@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "feishu": {
+      "command": "node",
+      "args": ["/opt/ShrimpBot/dist/index.js"],
+      "env": {
+        "FEISHU_APP_ID": "",
+        "FEISHU_APP_SECRET": ""
+      }
+    }
+  }
+}
