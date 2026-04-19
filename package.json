@@ -4,6 +4,9 @@
   "description": "Claude Code Channels bridge for Feishu",
   "type": "module",
   "main": "dist/index.js",
+  "bin": {
+    "claude-code-channels-feishu": "./dist/index.js"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
