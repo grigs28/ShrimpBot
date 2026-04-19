@@ -3,19 +3,21 @@
 set -euo pipefail
 
 # Resolve ShrimpBot home directory
-SHRIMPBOT_HOME="${SHRIMPBOT_HOME:-$HOME/shrimpbot}"
+SHRIMPBOT_HOME="${SHRIMPBOT_HOME:-}"
+if [ -z "$SHRIMPBOT_HOME" ]; then
+  for candidate in "/opt/ShrimpBot" "$HOME/shrimpbot" "$HOME/ShrimpBot"; do
+    if [ -f "$candidate/src/bridge/cli-bridge-entry.ts" ]; then
+      SHRIMPBOT_HOME="$candidate"
+      break
+    fi
+  done
+fi
 
-# If running from the repo bin/ dir, use that; otherwise use SHRIMPBOT_HOME
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-if [ -f "$SCRIPT_DIR/../dist/bridge/cli-bridge-entry.js" ]; then
-  BRIDGE_JS="$SCRIPT_DIR/../dist/bridge/cli-bridge-entry.js"
-elif [ -f "$SHRIMPBOT_HOME/dist/bridge/cli-bridge-entry.js" ]; then
-  BRIDGE_JS="$SHRIMPBOT_HOME/dist/bridge/cli-bridge-entry.js"
-else
-  echo "Error: Cannot find cli-bridge-entry.js"
+if [ -z "$SHRIMPBOT_HOME" ]; then
+  echo "Error: Cannot find ShrimpBot installation"
   echo "Set SHRIMPBOT_HOME to the ShrimpBot installation directory"
   exit 1
 fi
 
-# Forward all args to Node entry point
-exec node "$BRIDGE_JS" "$@"
+# Use tsx from ShrimpBot's node_modules to run TypeScript source directly
+exec "$SHRIMPBOT_HOME/node_modules/.bin/tsx" "$SHRIMPBOT_HOME/src/bridge/cli-bridge-entry.ts" "$@"
