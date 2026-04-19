@@ -23,6 +23,7 @@ import { metrics as _metrics } from '../utils/metrics.js';
 import type { SessionRegistry } from '../session/session-registry.js';
 import {
   jsonResponse,
+  handleBridgeRoutes,
   handleVoiceRoutes,
   handleFileRoutes,
   handleTeamRoutes,
@@ -34,6 +35,7 @@ import {
   handleSkillHubRoutes,
 } from './routes/index.js';
 import type { RouteContext } from './routes/index.js';
+import { BridgeRegistry } from './bridge-registry.js';
 
 /** Timing-safe string comparison to prevent timing attacks on tokens. */
 function safeCompare(a: string, b: string): boolean {
@@ -85,6 +87,7 @@ interface ApiServerOptions {
   budgetManager?: BudgetManager;
   teamManager?: TeamManager;
   sessionRegistry?: SessionRegistry;
+  bridgeRegistry?: BridgeRegistry;
 }
 
 const startTime = Date.now();
@@ -112,6 +115,9 @@ export function startApiServer(options: ApiServerOptions): http.Server {
 
   const ws: { handle?: WebSocketHandle } = {};
 
+  // Initialize bridge registry
+  const bridgeRegistry = options.bridgeRegistry ?? new BridgeRegistry(logger);
+
   // Build route context (shared across all route handlers)
   const ctx: RouteContext = {
     registry, scheduler, logger, botsConfigPath, docSync, feishuServiceClient,
@@ -123,10 +129,12 @@ export function startApiServer(options: ApiServerOptions): http.Server {
     sessionRegistry: options.sessionRegistry,
     activityStore,
     skillHubStore,
+    bridgeRegistry,
   };
 
   // Route handlers in priority order
   const routeHandlers = [
+    handleBridgeRoutes,
     handleVoiceRoutes,
     handleFileRoutes,
     handleTeamRoutes,

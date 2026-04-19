@@ -22,6 +22,7 @@ import { DocSync } from './sync/doc-sync.js';
 import { MemoryClient } from './memory/memory-client.js';
 
 import { SessionRegistry } from './session/session-registry.js';
+import { BridgeRegistry } from './api/bridge-registry.js';
 
 /** Restrict sensitive config files to owner-only (600). */
 function secureSensitiveFiles(): void {
@@ -279,6 +280,13 @@ async function main() {
     if (bot) bot.bridge.setSessionRegistry(sessionRegistry);
   }
 
+  // Inject bridge registry into all bot bridges for CLI bridge routing
+  const bridgeRegistry = new BridgeRegistry(logger);
+  for (const info of registry.list()) {
+    const bot = registry.get(info.name);
+    if (bot) bot.bridge.setBridgeRegistry(bridgeRegistry);
+  }
+
   // Resolve bots config path for API-driven bot CRUD
   const botsConfigPath = process.env.BOTS_CONFIG
     ? path.resolve(process.env.BOTS_CONFIG)
@@ -298,6 +306,7 @@ async function main() {
     memoryServerUrl: appConfig.memoryServerUrl,
     memoryAuthToken: appConfig.memory.adminToken || appConfig.memory.readerToken || appConfig.memory.secret || undefined,
     sessionRegistry,
+    bridgeRegistry,
   });
 
   // Graceful shutdown
