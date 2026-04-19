@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# shrimpbot-bridge-stop-hook — Claude Code Stop/StopFailure hook
+#
+# Called by Claude Code when it finishes responding (Stop) or errors (StopFailure).
+# Receives JSON on stdin. Forwards Claude's response to Feishu via ShrimpBot API
+# using the card format (same as normal ShrimpBot messages).
+#
+# Stop JSON:  { "last_assistant_message": "...", "hook_event_name": "Stop", ... }
+# StopFailure JSON: { "error_message": "...", "hook_event_name": "StopFailure", ... }
+
+set -euo pipefail
+
+API_URL="${SHRIMPBOT_BRIDGE_API:-http://localhost:9100}"
+CHAT_ID="${SHRIMPBOT_BRIDGE_CHAT:-}"
+BOT_NAME="${SHRIMPBOT_BRIDGE_BOT:-shrimpbot}"
+API_SECRET="${SHRIMPBOT_BRIDGE_SECRET:-}"
+LOG_FILE="/tmp/bridge-stop-hook.log"
+
+# No chatId — nothing to do
+[ -z "$CHAT_ID" ] && exit 0
+
+# Read hook JSON from stdin
+INPUT=$(cat)
+
+# Log for debugging
+echo "$(date +%H:%M:%S) INPUT: $(echo "$INPUT" | head -c 300)" >> "$LOG_FILE"
+
+# Detect event type
+EVENT=$(echo "$INPUT" | jq -r '.hook_event_name // "Stop"' 2>/dev/null)
+
+# Extract text based on event type
+if [ "$EVENT" = "StopFailure" ]; then
+  TEXT=$(echo "$INPUT" | jq -r '.error_message // .last_assistant_message // "Unknown error"' 2>/dev/null)
+  STATUS="error"
+  PROMPT="Claude Code 出错了"
+else
+  TEXT=$(echo "$INPUT" | jq -r '.last_assistant_message // empty' 2>/dev/null || true)
+  STATUS="complete"
+  PROMPT="[终端 Claude]"
+fi
+
+[ -z "$TEXT" ] && exit 0
+
+# Truncate for Feishu
+TEXT=$(echo "$TEXT" | head -c 4000)
+
+# Build auth header
+AUTH_ARGS=()
+[ -n "$API_SECRET" ] && AUTH_ARGS=(-H "Authorization: Bearer $API_SECRET")
+
+# Send as card (same format ShrimpBot uses — nice Feishu card with status)
+# First try to update existing card, if none exists send a new one
+curl -s -X POST "${API_URL}/bridge/events/${CHAT_ID}" \
+  -H "Content-Type: application/json" \
+  "${AUTH_ARGS[@]}" \
+  -d "$(jq -n \
+    --arg bot "$BOT_NAME" \
+    --arg status "$STATUS" \
+    --arg prompt "$PROMPT" \
+    --arg text "$TEXT" \
+    '{
+      type: "initial",
+      botName: $bot,
+      state: {
+        status: $status,
+        userPrompt: $prompt,
+        responseText: $text,
+        toolCalls: []
+      }
+    }')" \
+  > /dev/null 2>&1 || true
+
+echo "$(date +%H:%M:%S) SENT: status=$STATUS len=${#TEXT}" >> "$LOG_FILE"
+
+exit 0

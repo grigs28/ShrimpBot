@@ -1,17 +1,15 @@
 /**
- * ⚠️ EXPERIMENTAL — CLI Bridge (pure message relay)
+ * ⚠️ EXPERIMENTAL — CLI Bridge with PTY + Stop Hook
  *
- * This module provides a terminal-based relay between Feishu and a terminal session.
- * Messages from Feishu are displayed in the terminal; terminal input is forwarded to Feishu.
+ * Architecture:
+ * - PTY: Spawns Claude Code in a pseudo-terminal for full interactive UI
+ * - Stop Hook: Forwards Claude's clean response text to Feishu (no garbled output)
+ * - Feishu injection: Polls for Feishu messages and injects into Claude's stdin
  *
- * Limitation: This does NOT integrate with Claude Code CLI. Claude Code's interactive mode
- * requires a real TTY and cannot be bridged programmatically. For automatic Feishu→Claude
- * message handling, use ShrimpBot's built-in SDK headless mode (the default behavior).
- *
- * See: https://github.com/x-zheng16/uclaw for an alternative approach using Python Agent SDK.
+ * Claude → Feishu: via Stop hook (bin/bridge-stop-hook) — receives clean text
+ * Feishu → Claude: via PTY stdin injection
  */
-import * as readline from 'node:readline';
-import { TerminalUI } from './terminal-ui.js';
+import { spawn, type IPty } from '@homebridge/node-pty-prebuilt-multiarch';
 import type { CardState } from '../types.js';
 
 export interface BridgeOptions {
@@ -24,22 +22,18 @@ export interface BridgeOptions {
 }
 
 /**
- * CLIBridge — pure message relay between Feishu and the terminal.
+ * CLIBridge — PTY-based bridge between Claude Code and Feishu.
  *
- * Does NOT spawn Claude Code. Instead, it:
- * 1. Registers with ShrimpBot API for a specific chatId
- * 2. Polls for Feishu messages → prints them in terminal (user copies to claude)
- * 3. Reads terminal input → forwards to Feishu as "[终端]" messages
- *
- * Usage: user runs `claude` in one terminal, `shrimpbot-bridge` in another.
- * The bridge keeps both sides in sync.
+ * 1. Spawns Claude Code in a PTY (user sees and operates the real UI)
+ * 2. Sets env vars so Claude Code's Stop hook can forward responses to Feishu
+ * 3. Polls for Feishu messages → injects into Claude Code's stdin
  */
 export class CLIBridge {
-  private terminal = new TerminalUI();
   private heartbeatInterval?: ReturnType<typeof setInterval>;
   private pollInterval?: ReturnType<typeof setInterval>;
-  private rl?: readline.Interface;
+  private ptyProcess?: IPty;
   private running = false;
+  private lastFeishuTimestamp = 0;
 
   constructor(private options: BridgeOptions) {}
 
@@ -49,18 +43,15 @@ export class CLIBridge {
       chatId: this.options.chatId,
     });
     if (registerRes === null) {
-      this.terminal.showError(
-        `注册失败：chatId ${this.options.chatId} 已被其他 bridge 绑定或 API 错误`,
-      );
+      console.error(`\x1b[31m注册失败：chatId ${this.options.chatId} 已被其他 bridge 绑定或 API 错误\x1b[0m`);
       process.exit(1);
     }
-    this.terminal.showStatus(`已绑定 chatId: ${this.options.chatId}`);
 
     // 2. Send initial card to Feishu
     const initialState: CardState = {
       status: 'running',
-      userPrompt: 'Bridge 已连接',
-      responseText: '终端 Bridge 已启动，等待消息...',
+      userPrompt: 'Bridge PTY 已连接',
+      responseText: 'Claude Code 正在启动...',
       toolCalls: [],
     };
     await this.sendFeishuEvent('initial', initialState);
@@ -70,26 +61,55 @@ export class CLIBridge {
       this.apiCall('POST', '/bridge/heartbeat', { chatId: this.options.chatId }).catch(() => {});
     }, 10_000);
 
-    // 4. Poll Feishu messages
+    // 4. Spawn Claude Code in PTY with bridge env vars for Stop hook
+    const cwd = this.options.workingDirectory || process.cwd();
+    this.ptyProcess = spawn('claude', [], {
+      name: 'xterm-256color',
+      cols: process.stdout.columns || 120,
+      rows: process.stdout.rows || 40,
+      cwd,
+      env: {
+        ...process.env,
+        // Pass bridge config to Claude Code's Stop hook via env
+        SHRIMPBOT_BRIDGE_API: this.options.apiUrl,
+        SHRIMPBOT_BRIDGE_CHAT: this.options.chatId,
+        SHRIMPBOT_BRIDGE_BOT: this.options.botName,
+        SHRIMPBOT_BRIDGE_SECRET: this.options.apiSecret || '',
+      } as Record<string, string>,
+    });
+
+    // 5. Wire PTY ↔ real terminal (just pass-through, no output parsing)
+    this.ptyProcess.onData((data: string) => {
+      process.stdout.write(data);
+    });
+
+    this.ptyProcess.onExit(({ exitCode }: { exitCode: number }) => {
+      this.running = false;
+      console.log(`\n\x1b[33mClaude Code exited (code ${exitCode}). Bridge closing...\x1b[0m`);
+      this.cleanup().then(() => process.exit(exitCode));
+    });
+
+    // Forward user keystrokes to PTY (raw mode for full terminal control)
+    process.stdin.setRawMode(true);
+    process.stdin.on('data', (data: Buffer) => {
+      this.ptyProcess?.write(data.toString('utf8'));
+    });
+
+    // 6. Poll Feishu messages and inject into Claude
     this.running = true;
     this.pollInterval = setInterval(() => {
-      this.pollMessages().catch(() => {});
-    }, 500);
+      this.pollAndInject().catch(() => {});
+    }, 1000);
 
-    // 5. Terminal input → forward to Feishu
-    this.rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-      prompt: '',
-    });
-    this.rl.on('line', (line) => {
-      this.handleTerminalInput(line);
+    // Handle terminal resize
+    process.stdout.on('resize', () => {
+      this.ptyProcess?.resize(
+        process.stdout.columns || 120,
+        process.stdout.rows || 40,
+      );
     });
 
-    this.terminal.showStatus('Bridge 已启动。飞书消息会显示在这里。');
-    this.terminal.showStatus('输入文字按回车，消息会转发到飞书。');
-    this.terminal.showStatus('按 Ctrl+C 退出。');
-    this.terminal.showStatus('---');
+    console.error('\x1b[32mBridge PTY 已启动。Claude Code 输出通过 Stop hook 转发飞书。\x1b[0m');
   }
 
   async cleanup(): Promise<void> {
@@ -102,14 +122,31 @@ export class CLIBridge {
       clearInterval(this.pollInterval);
       this.pollInterval = undefined;
     }
-    if (this.rl) {
-      this.rl.close();
-      this.rl = undefined;
-    }
+    try { process.stdin.setRawMode(false); } catch { /* ignore */ }
+    this.ptyProcess?.kill();
     await this.apiCall('POST', '/bridge/unregister', {
       chatId: this.options.chatId,
     });
   }
+
+  // ─── Feishu message injection ──────────────────────────────────────
+
+  private async pollAndInject(): Promise<void> {
+    if (!this.running || !this.ptyProcess) return;
+    const msg = await this.apiCall('GET', `/bridge/messages/${this.options.chatId}`);
+    if (msg && msg.text && msg.timestamp > this.lastFeishuTimestamp) {
+      this.lastFeishuTimestamp = msg.timestamp;
+      const userName = msg.userId || '飞书';
+      // Inject Feishu message into Claude Code
+      // Send Escape first to cancel any current input
+      this.ptyProcess.write('\x1b');
+      setTimeout(() => {
+        this.ptyProcess?.write(`[飞书:${userName}] ${msg.text}\r`);
+      }, 500);
+    }
+  }
+
+  // ─── API helpers ───────────────────────────────────────────────────
 
   private async apiCall(
     method: string,
@@ -141,27 +178,5 @@ export class CLIBridge {
       state,
     };
     await this.apiCall('POST', `/bridge/events/${this.options.chatId}`, payload as Record<string, unknown>);
-  }
-
-  private async pollMessages(): Promise<void> {
-    if (!this.running) return;
-    const msg = await this.apiCall('GET', `/bridge/messages/${this.options.chatId}`);
-    if (msg && msg.text) {
-      this.terminal.showFeishuMessage(msg.userId || '飞书用户', msg.text);
-    }
-  }
-
-  private handleTerminalInput(line: string): void {
-    const trimmed = line.trim();
-    if (!trimmed || !this.running) return;
-
-    this.terminal.showTerminalInput(trimmed);
-
-    // Forward terminal input to Feishu
-    this.apiCall('POST', `/bridge/events/${this.options.chatId}`, {
-      type: 'terminal_input',
-      botName: this.options.botName,
-      text: trimmed,
-    }).catch(() => {});
   }
 }
