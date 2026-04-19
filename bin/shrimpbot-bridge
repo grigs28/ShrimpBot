@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# shrimpbot-bridge — Bridge Claude Code CLI to Feishu via ShrimpBot
+# shrimpbot-bridge — ⚠️ EXPERIMENTAL: Terminal relay for Feishu messages
+#
+# This is a pure message relay (Feishu ↔ terminal). It does NOT integrate with
+# Claude Code CLI. For automatic Feishu→Claude handling, use ShrimpBot's SDK mode.
 set -euo pipefail
 
 # Resolve ShrimpBot home directory

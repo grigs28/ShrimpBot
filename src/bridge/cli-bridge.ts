@@ -1,3 +1,15 @@
+/**
+ * ⚠️ EXPERIMENTAL — CLI Bridge (pure message relay)
+ *
+ * This module provides a terminal-based relay between Feishu and a terminal session.
+ * Messages from Feishu are displayed in the terminal; terminal input is forwarded to Feishu.
+ *
+ * Limitation: This does NOT integrate with Claude Code CLI. Claude Code's interactive mode
+ * requires a real TTY and cannot be bridged programmatically. For automatic Feishu→Claude
+ * message handling, use ShrimpBot's built-in SDK headless mode (the default behavior).
+ *
+ * See: https://github.com/x-zheng16/uclaw for an alternative approach using Python Agent SDK.
+ */
 import * as readline from 'node:readline';
 import { TerminalUI } from './terminal-ui.js';
 import type { CardState } from '../types.js';
