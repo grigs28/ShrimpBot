@@ -56,7 +56,8 @@ export class FeishuService {
     const server = http.createServer(async (req, res) => {
       if (req.method === 'GET') {
         // 飞书验证 URL
-        const url = new URL(req.url, `http://localhost:${port}`);
+        const reqUrl = req.url || '/';
+        const url = new URL(reqUrl, `http://localhost:${port}`);
         const challenge = url.searchParams.get('challenge');
         if (challenge) {
           res.writeHead(200, { 'Content-Type': 'text/plain' });

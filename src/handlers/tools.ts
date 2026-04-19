@@ -28,7 +28,7 @@ export class ToolsHandler {
 
   private async listChats(): Promise<any> {
     try {
-      const response = await this.feishuService.getClient().im.v1.chat.get();
+      const response = await this.feishuService.getClient().im.v1.chat.get() as any;
       const chats = response.data?.items || [];
       return {
         chats: chats.map((chat: any) => ({

@@ -1,20 +1,10 @@
-import type { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-
 export const SERVER_CAPABILITIES = {
   capabilities: {
     experimental: {
       'claude/channel': {},
     },
-    tools: {
-      list: true,
-      call: true,
-    },
+    tools: {},
   },
-};
-
-export const TOOL_SCHEMAS = {
-  list: ListToolsRequestSchema,
-  call: CallToolRequestSchema,
 };
 
 // 可用工具列表

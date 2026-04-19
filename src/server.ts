@@ -1,5 +1,6 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { FeishuService } from './services/feishu.js';
 import { SessionService } from './services/session.js';
 import { ChannelHandler } from './handlers/channel.js';
@@ -29,9 +30,9 @@ export class MCPServer {
   }
 
   private setupHandlers() {
-    // 处理 Claude Channel 通知
+    // 处理 Claude Channel 通知（实验性 API，使用 as any）
     this.server.setRequestHandler(
-      { method: 'notifications/claude/channel' } as any,
+      'notifications/claude/channel' as any,
       async (params: any) => {
         await this.channelHandler.handleNotification(params);
         return { status: 'ok' };
@@ -40,15 +41,15 @@ export class MCPServer {
 
     // 处理工具列表
     this.server.setRequestHandler(
-      { method: 'tools/list' },
+      ListToolsRequestSchema,
       async () => this.toolsHandler.listTools()
     );
 
     // 处理工具调用
     this.server.setRequestHandler(
-      { method: 'tools/call' },
+      CallToolRequestSchema,
       async (params: any) => {
-        const result = await this.toolsHandler.callTool(params.name, params.arguments);
+        const result = await this.toolsHandler.callTool(params.arguments.name, params.arguments.arguments);
         return { content: [{ type: 'text', text: result }] };
       }
     );
