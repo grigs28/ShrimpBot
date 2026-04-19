@@ -25,6 +25,19 @@ export interface Session {
 export interface Config {
   feishuAppId: string;
   feishuAppSecret: string;
+  botName: string;
+  chatIds: string[];
   webhookPort: number;
   debug: boolean;
+}
+
+export interface BotConfig {
+  name: string;
+  appId: string;
+  appSecret: string;
+  chatIds: string[];
+}
+
+export interface MultiBotConfig {
+  bots: BotConfig[];
 }
