@@ -4,8 +4,8 @@
       "command": "node",
       "args": ["/opt/ShrimpBot/dist/index.js"],
       "env": {
-        "FEISHU_APP_ID": "",
-        "FEISHU_APP_SECRET": ""
+        "FEISHU_APP_ID": "cli_a9474d2ef5781bce",
+        "FEISHU_APP_SECRET": "9B0ATvRNCn9wguH3HrjkXbYlLOTm6MKy"
       }
     }
   }

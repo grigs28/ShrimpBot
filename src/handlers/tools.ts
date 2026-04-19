@@ -11,6 +11,14 @@ export class ToolsHandler {
 
   // 处理工具调用
   async callTool(name: string, args: Record<string, any>): Promise<any> {
+    // 防止原型污染攻击
+    const dangerous = ['__proto__', 'constructor', 'prototype'];
+    for (const key of Object.keys(args)) {
+      if (dangerous.includes(key)) {
+        throw new Error(`Invalid argument key: ${key}`);
+      }
+    }
+
     switch (name) {
       case 'send_feishu_message':
         return this.sendMessage(args.chat_id, args.text);
