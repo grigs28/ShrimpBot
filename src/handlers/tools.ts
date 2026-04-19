@@ -27,7 +27,19 @@ export class ToolsHandler {
   }
 
   private async listChats(): Promise<any> {
-    // TODO: 实现获取会话列表
-    return { chats: [] };
+    try {
+      const response = await this.feishuService.getClient().im.v1.chat.get();
+      const chats = response.data?.items || [];
+      return {
+        chats: chats.map((chat: any) => ({
+          chat_id: chat.chat_id,
+          name: chat.name,
+          description: chat.description,
+        }))
+      };
+    } catch (err) {
+      console.error('获取会话列表失败:', err);
+      return { chats: [] };
+    }
   }
 }

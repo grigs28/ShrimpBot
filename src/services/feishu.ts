@@ -1,3 +1,5 @@
+import http from 'node:http';
+import crypto from 'node:crypto';
 import { Client } from '@larksuiteoapi/node-sdk';
 import type { FeishuMessage } from '../types/index.js';
 
@@ -49,8 +51,67 @@ export class FeishuService {
     handler(message);
   }
 
-  // 启动 Webhook 监听（占位，后续实现）
-  startWebhook(port: number): void {
-    // TODO: 实现 Webhook 服务器
+  // Webhook 事件处理
+  startWebhook(port: number, verificationToken: string, encryptKey: string): void {
+    const server = http.createServer(async (req, res) => {
+      if (req.method === 'GET') {
+        // 飞书验证 URL
+        const url = new URL(req.url, `http://localhost:${port}`);
+        const challenge = url.searchParams.get('challenge');
+        if (challenge) {
+          res.writeHead(200, { 'Content-Type': 'text/plain' });
+          res.end(challenge);
+          return;
+        }
+      }
+
+      if (req.method === 'POST') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            // 解析 JSON
+            const event = JSON.parse(body);
+
+            // 验证签名（如果提供了 encrypt_key）
+            if (encryptKey && event.encrypt) {
+              const decipher = crypto.createDecipheriv(
+                'aes-256-cbc',
+                encryptKey.slice(0, 32).padEnd(32, '0'),
+                Buffer.alloc(16, 0)
+              );
+              let decrypted = decipher.update(event.encrypt, 'base64', 'utf8');
+              decrypted += decipher.final('utf8');
+              Object.assign(event, JSON.parse(decrypted));
+            }
+
+            // 处理消息事件
+            if (event.event?.message) {
+              await this.handleFeishuEvent(event);
+            }
+
+            res.writeHead(200);
+            res.end('ok');
+          } catch (err) {
+            console.error('Webhook 处理失败:', err);
+            res.writeHead(500);
+            res.end('error');
+          }
+        });
+        return;
+      }
+
+      res.writeHead(404);
+      res.end();
+    });
+
+    server.listen(port, () => {
+      console.error(`Webhook 服务器已启动，监听端口 ${port}`);
+    });
+  }
+
+  // 获取飞书 SDK Client 实例
+  getClient(): Client {
+    return this.client;
   }
 }
