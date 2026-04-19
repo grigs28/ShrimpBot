@@ -4,8 +4,8 @@ export function loadMultiBotConfig(): MultiBotConfig {
   const botsJson = process.env.FEISHU_BOTS || '[]';
   try {
     return JSON.parse(botsJson);
-  } catch {
-    throw new Error('Invalid FEISHU_BOTS JSON');
+  } catch (e) {
+    throw new Error(`Invalid FEISHU_BOTS JSON: ${(e as Error).message}`);
   }
 }
 

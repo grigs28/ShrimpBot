@@ -3,12 +3,17 @@ import { loadMultiBotConfig, loadSingleBotConfig } from './config.js';
 import type { Config } from './types/index.js';
 
 function getConfig(): Config {
+  const single = loadSingleBotConfig();
+  const port = parseInt(process.env.FEISHU_WEBHOOK_PORT || '8080', 10);
+  if (isNaN(port) || port < 1 || port > 65535) {
+    throw new Error('Invalid FEISHU_WEBHOOK_PORT must be a number between 1 and 65535');
+  }
   return {
-    feishuAppId: process.env.FEISHU_APP_ID || '',
-    feishuAppSecret: process.env.FEISHU_APP_SECRET || '',
-    botName: process.env.FEISHU_BOT_NAME || 'ShrimpBot',
-    chatIds: (process.env.FEISHU_CHAT_IDS || '').split(',').filter(Boolean),
-    webhookPort: parseInt(process.env.FEISHU_WEBHOOK_PORT || '8080', 10),
+    feishuAppId: single.appId,
+    feishuAppSecret: single.appSecret,
+    botName: single.name,
+    chatIds: single.chatIds,
+    webhookPort: port,
     debug: process.env.DEBUG === 'true',
   };
 }
