@@ -282,9 +282,14 @@ async function main() {
 
   // Inject bridge registry into all bot bridges for CLI bridge routing
   const bridgeRegistry = new BridgeRegistry(logger);
+  const { KnownChatsStore } = await import('./api/known-chats-store.js');
+  const knownChatsStore = new KnownChatsStore(path.join(process.cwd(), 'data'), logger);
   for (const info of registry.list()) {
     const bot = registry.get(info.name);
-    if (bot) bot.bridge.setBridgeRegistry(bridgeRegistry);
+    if (bot) {
+      bot.bridge.setBridgeRegistry(bridgeRegistry);
+      bot.bridge.setKnownChatsStore(knownChatsStore);
+    }
   }
 
   // Resolve bots config path for API-driven bot CRUD

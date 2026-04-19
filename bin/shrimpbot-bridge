@@ -2,8 +2,20 @@
 # shrimpbot-bridge — Bridge Claude Code CLI to Feishu via ShrimpBot
 set -euo pipefail
 
+# Resolve ShrimpBot home directory
+SHRIMPBOT_HOME="${SHRIMPBOT_HOME:-$HOME/shrimpbot}"
+
+# If running from the repo bin/ dir, use that; otherwise use SHRIMPBOT_HOME
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BRIDGE_JS="$SCRIPT_DIR/../dist/bridge/cli-bridge-entry.js"
+if [ -f "$SCRIPT_DIR/../dist/bridge/cli-bridge-entry.js" ]; then
+  BRIDGE_JS="$SCRIPT_DIR/../dist/bridge/cli-bridge-entry.js"
+elif [ -f "$SHRIMPBOT_HOME/dist/bridge/cli-bridge-entry.js" ]; then
+  BRIDGE_JS="$SHRIMPBOT_HOME/dist/bridge/cli-bridge-entry.js"
+else
+  echo "Error: Cannot find cli-bridge-entry.js"
+  echo "Set SHRIMPBOT_HOME to the ShrimpBot installation directory"
+  exit 1
+fi
 
 # Forward all args to Node entry point
 exec node "$BRIDGE_JS" "$@"

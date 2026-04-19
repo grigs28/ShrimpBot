@@ -19,6 +19,7 @@ import type { SessionRegistry } from '../../session/session-registry.js';
 import type { ActivityStore } from '../activity-store.js';
 import type { SkillHubStore } from '../skill-hub-store.js';
 import type { BridgeRegistry } from '../bridge-registry.js';
+import type { KnownChatsStore } from '../known-chats-store.js';
 
 export interface RouteContext {
   registry: BotRegistry;
@@ -43,6 +44,7 @@ export interface RouteContext {
   activityStore?: ActivityStore;
   skillHubStore?: SkillHubStore;
   bridgeRegistry?: BridgeRegistry;
+  knownChatsStore?: KnownChatsStore;
 }
 
 /**

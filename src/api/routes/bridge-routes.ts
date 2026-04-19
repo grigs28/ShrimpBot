@@ -112,17 +112,9 @@ export async function handleBridgeRoutes(
     return true;
   }
 
-  // GET /bridge/chats — list available bots (for --pick)
+  // GET /bridge/chats — list known chats for --pick
   if (method === 'GET' && url === '/bridge/chats') {
-    const bots = registry.list();
-    const chats: Array<{ botName: string; chatId: string; label: string }> = [];
-    for (const info of bots) {
-      chats.push({
-        botName: info.name,
-        chatId: '',
-        label: `Bot: ${info.name} (${info.platform})`,
-      });
-    }
+    const chats = ctx.knownChatsStore?.list() ?? [];
     jsonResponse(res, 200, { chats });
     return true;
   }

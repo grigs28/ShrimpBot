@@ -114,6 +114,8 @@ export class MessageBridge {
   private feishuConfirm?: FeishuConfirm;
   /** Bridge registry — when set, checks if a chatId has an active CLI bridge. */
   private bridgeRegistry?: BridgeRegistry;
+  /** Known chats store — records chatIds from incoming messages for --pick. */
+  private knownChatsStore?: import('../api/known-chats-store.js').KnownChatsStore;
   private runningTasks = new Map<string, RunningTask>(); // keyed by chatId
   private messageQueues = new Map<string, IncomingMessage[]>(); // per-chatId message queue
   private pendingBatches = new Map<string, PendingBatch>(); // media debounce batches
@@ -152,6 +154,11 @@ export class MessageBridge {
   /** Inject the bridge registry for CLI bridge routing. */
   setBridgeRegistry(registry: BridgeRegistry): void {
     this.bridgeRegistry = registry;
+  }
+
+  /** Inject the known chats store for recording chatIds. */
+  setKnownChatsStore(store: import('../api/known-chats-store.js').KnownChatsStore): void {
+    this.knownChatsStore = store;
   }
 
   /** Emit an activity event if a listener is registered. */
@@ -221,6 +228,9 @@ export class MessageBridge {
 
   async handleMessage(msg: IncomingMessage): Promise<void> {
     const { chatId, text } = msg;
+
+    // Record this chatId for --pick discovery
+    this.knownChatsStore?.record(chatId, msg.chatType, msg.userId);
 
     // Check if this chatId has an active CLI bridge — forward message via API
     if (this.bridgeRegistry?.hasBinding(chatId)) {

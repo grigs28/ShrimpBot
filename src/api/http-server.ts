@@ -36,6 +36,7 @@ import {
 } from './routes/index.js';
 import type { RouteContext } from './routes/index.js';
 import { BridgeRegistry } from './bridge-registry.js';
+import { KnownChatsStore } from './known-chats-store.js';
 
 /** Timing-safe string comparison to prevent timing attacks on tokens. */
 function safeCompare(a: string, b: string): boolean {
@@ -115,6 +116,8 @@ export function startApiServer(options: ApiServerOptions): http.Server {
 
   const ws: { handle?: WebSocketHandle } = {};
 
+  const knownChatsStore = new KnownChatsStore(path.join(process.cwd(), 'data'), logger);
+
   // Initialize bridge registry
   const bridgeRegistry = options.bridgeRegistry ?? new BridgeRegistry(logger);
 
@@ -130,6 +133,7 @@ export function startApiServer(options: ApiServerOptions): http.Server {
     activityStore,
     skillHubStore,
     bridgeRegistry,
+    knownChatsStore,
   };
 
   // Route handlers in priority order
