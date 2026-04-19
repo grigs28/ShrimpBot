@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# shrimpbot-bridge — Bridge Claude Code CLI to Feishu via ShrimpBot
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BRIDGE_JS="$SCRIPT_DIR/../dist/bridge/cli-bridge-entry.js"
+
+# Forward all args to Node entry point
+exec node "$BRIDGE_JS" "$@"
