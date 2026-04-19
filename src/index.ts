@@ -1,5 +1,7 @@
 import { MCPServer } from './server.js';
 import { loadMultiBotConfig, loadSingleBotConfig } from './config.js';
+import { Master } from './master.js';
+import { startBot } from './bot.js';
 import type { Config } from './types/index.js';
 
 function getConfig(): Config {
@@ -19,15 +21,21 @@ function getConfig(): Config {
 }
 
 async function main() {
-  const config = getConfig();
+  const mode = process.env.FEISHU_MODE || 'single';
 
-  if (!config.feishuAppId || !config.feishuAppSecret) {
-    console.error('错误：需要设置 FEISHU_APP_ID 和 FEISHU_APP_SECRET 环境变量');
-    process.exit(1);
+  if (mode === 'master') {
+    const config = loadMultiBotConfig();
+    const master = new Master(config);
+    await master.start();
+    process.on('SIGINT', () => master.stop());
+  } else {
+    const config = getConfig();
+    if (!config.feishuAppId || !config.feishuAppSecret) {
+      console.error('错误：需要设置 FEISHU_APP_ID 和 FEISHU_APP_SECRET 环境变量');
+      process.exit(1);
+    }
+    await startBot(config);
   }
-
-  const server = new MCPServer(config);
-  await server.start();
 }
 
 main().catch((err) => {
