@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# shrimpbot-bridge-ask-hook — Claude Code PreToolUse hook for AskUserQuestion
+#
+# Fires when Claude calls AskUserQuestion tool. Extracts the question text
+# and options, forwards to Feishu as a card. User can respond from Feishu
+# (answer is injected back into Claude's stdin by the bridge).
+#
+# PreToolUse JSON: { "tool_name": "AskUserQuestion", "tool_input": { "questions": [...] } }
+
+set -euo pipefail
+
+API_URL="${SHRIMPBOT_BRIDGE_API:-http://localhost:9100}"
+CHAT_ID="${SHRIMPBOT_BRIDGE_CHAT:-}"
+BOT_NAME="${SHRIMPBOT_BRIDGE_BOT:-shrimpbot}"
+API_SECRET="${SHRIMPBOT_BRIDGE_SECRET:-}"
+LOG_FILE="/tmp/bridge-stop-hook.log"
+
+[ -z "$CHAT_ID" ] && exit 0
+
+INPUT=$(cat)
+
+TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null || true)
+
+# Only handle AskUserQuestion
+[ "$TOOL_NAME" != "AskUserQuestion" ] && exit 0
+
+echo "$(date +%H:%M:%S) ASK hook triggered" >> "$LOG_FILE"
+
+# Extract questions array
+QUESTIONS=$(echo "$INPUT" | jq -r '.tool_input.questions // []' 2>/dev/null || echo '[]')
+
+# Build a readable text from the questions
+TEXT=""
+COUNT=$(echo "$QUESTIONS" | jq 'length' 2>/dev/null || echo 0)
+
+for i in $(seq 0 $((COUNT - 1)) 2>/dev/null); do
+  Q_HEADER=$(echo "$QUESTIONS" | jq -r ".[$i].question // \"Question\"" 2>/dev/null)
+  TEXT+="**$Q_HEADER**\n"
+
+  OPTIONS=$(echo "$QUESTIONS" | jq -r ".[$i].options // []" 2>/dev/null)
+  OPT_COUNT=$(echo "$OPTIONS" | jq 'length' 2>/dev/null || echo 0)
+
+  for j in $(seq 0 $((OPT_COUNT - 1)) 2>/dev/null); do
+    OPT_LABEL=$(echo "$OPTIONS" | jq -r ".[$j].label // \"Option $((j+1))\"" 2>/dev/null)
+    TEXT+="$((j+1)). $OPT_LABEL\n"
+  done
+  TEXT+="\n"
+done
+
+[ -z "$TEXT" ] && exit 0
+
+TEXT=$(echo -e "$TEXT" | head -c 4000)
+
+echo "$(date +%H:%M:%S) ASK text: $(echo -e "$TEXT" | head -c 200)" >> "$LOG_FILE"
+
+# Send to Feishu as card
+AUTH_ARGS=()
+[ -n "$API_SECRET" ] && AUTH_ARGS=(-H "Authorization: Bearer $API_SECRET")
+
+curl -s -X POST "${API_URL}/bridge/events/${CHAT_ID}" \
+  -H "Content-Type: application/json" \
+  "${AUTH_ARGS[@]}" \
+  -d "$(jq -n \
+    --arg bot "$BOT_NAME" \
+    --arg text "$TEXT" \
+    '{
+      type: "initial",
+      botName: $bot,
+      state: {
+        status: "waiting",
+        userPrompt: "Claude 需要你选择",
+        responseText: $text,
+        toolCalls: []
+      }
+    }')" \
+  > /dev/null 2>&1 || true
+
+exit 0

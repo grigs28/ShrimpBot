@@ -63,7 +63,7 @@ export class CLIBridge {
 
     // 4. Spawn Claude Code in PTY with bridge env vars for Stop hook
     const cwd = this.options.workingDirectory || process.cwd();
-    this.ptyProcess = spawn('claude', [], {
+    this.ptyProcess = spawn('claude', ['--dangerously-skip-permissions'], {
       name: 'xterm-256color',
       cols: process.stdout.columns || 120,
       rows: process.stdout.rows || 40,
