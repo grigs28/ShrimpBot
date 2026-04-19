@@ -39,7 +39,12 @@ async function main() {
       console.error('错误：需要设置 FEISHU_APP_ID 和 FEISHU_APP_SECRET 环境变量');
       process.exit(1);
     }
-    await startBot(config);
+    await startBot({
+      name: config.botName,
+      appId: config.feishuAppId,
+      appSecret: config.feishuAppSecret,
+      chatIds: config.chatIds,
+    });
   }
 }
 

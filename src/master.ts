@@ -1,5 +1,6 @@
 // src/master.ts
 
+import http from 'http';
 import type { MultiBotConfig, BotConfig } from './types/index.js';
 import { spawn, ChildProcess } from 'child_process';
 
@@ -7,6 +8,7 @@ export class Master {
   private botProcesses: Map<string, ChildProcess> = new Map();
   private pendingRestarts: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private chatIdToBot: Map<string, string> = new Map();
+  private routerServer: http.Server;
 
   constructor(private config: MultiBotConfig) {
     for (const bot of config.bots) {
@@ -14,12 +16,58 @@ export class Master {
         this.chatIdToBot.set(chatId, bot.name);
       }
     }
+
+    // 创建 HTTP 路由服务器
+    this.routerServer = http.createServer(async (req, res) => {
+      if (req.method === 'POST' && req.url === '/route') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const { chat_id, content } = JSON.parse(body);
+            const botName = this.routeByChatId(chat_id);
+            if (!botName) {
+              res.writeHead(404, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'Bot not found for chat_id' }));
+              return;
+            }
+            const bot = this.botProcesses.get(botName);
+            if (!bot || !bot.stdin) {
+              res.writeHead(500, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'Bot process not available' }));
+              return;
+            }
+            // 发送到对应 Bot
+            bot.stdin.write(JSON.stringify({ chat_id, content }) + '\n');
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: true, bot: botName }));
+          } catch (err) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Internal error' }));
+          }
+        });
+      } else if (req.method === 'GET' && req.url === '/health') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'ok', bots: this.config.bots.length }));
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    });
   }
 
   async start(): Promise<void> {
+    // 启动每个 Bot 子进程
     for (const bot of this.config.bots) {
       this.startBotProcess(bot);
     }
+
+    // 启动 HTTP 路由服务器
+    const port = parseInt(process.env.FEISHU_ROUTER_PORT || '9090', 10);
+    this.routerServer.listen(port, () => {
+      console.error(`Router server listening on port ${port}`);
+    });
+
     console.error('Master started with', this.config.bots.length, 'bots');
   }
 
@@ -72,6 +120,9 @@ export class Master {
       clearTimeout(timeout);
     }
     this.pendingRestarts.clear();
+
+    // 关闭 HTTP 服务器
+    this.routerServer.close();
 
     // 终止所有进程
     for (const [name, proc] of this.botProcesses) {
