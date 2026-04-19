@@ -1,3 +1,5 @@
+// src/bot.ts
+
 import { MCPServer } from './server.js';
 import type { Config } from './types/index.js';
 
@@ -12,5 +14,11 @@ export async function startBot(config: Config): Promise<void> {
   });
 
   console.error(`Bot ${config.botName} starting for chatIds: ${config.chatIds.join(', ')}`);
-  await server.start();
+
+  try {
+    await server.start();
+  } catch (err) {
+    console.error(`Bot ${config.botName} failed to start:`, err);
+    throw err;
+  }
 }

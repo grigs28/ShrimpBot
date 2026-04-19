@@ -1,3 +1,5 @@
+// src/index.ts
+
 import { MCPServer } from './server.js';
 import { loadMultiBotConfig, loadSingleBotConfig } from './config.js';
 import { Master } from './master.js';
@@ -27,7 +29,10 @@ async function main() {
     const config = loadMultiBotConfig();
     const master = new Master(config);
     await master.start();
-    process.on('SIGINT', () => master.stop());
+    process.on('SIGINT', () => {
+      master.stop();
+      process.exit(0);
+    });
   } else {
     const config = getConfig();
     if (!config.feishuAppId || !config.feishuAppSecret) {
@@ -37,6 +42,17 @@ async function main() {
     await startBot(config);
   }
 }
+
+// 全局异常处理
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection:', reason);
+  process.exit(1);
+});
 
 main().catch((err) => {
   console.error('启动失败:', err);
