@@ -19,6 +19,7 @@ import { OutputHandler } from './output-handler.js';
 import { CostTracker } from '../utils/cost-tracker.js';
 import { metrics } from '../utils/metrics.js';
 import type { SessionRegistry } from '../session/session-registry.js';
+import type { BridgeRegistry, BridgeMessage } from '../api/bridge-registry.js';
 
 const TASK_TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24 hours
 const QUESTION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes for user to answer
@@ -48,6 +49,8 @@ interface RunningTask {
   collectedAnswers: Record<string, string>;
   cardMessageId: string;
   questionTimeoutId?: ReturnType<typeof setTimeout>;
+  /** Whether a Feishu confirmation card has been sent for text-based confirmation */
+  confirmationSent?: boolean;
   processor: StreamProcessor;
   rateLimiter: RateLimiter;
   chatId: string;
@@ -109,6 +112,8 @@ export class MessageBridge {
   private sessionRegistry?: SessionRegistry;
   /** Feishu confirmation handler — injected for Feishu bots to enable interactive confirmation cards. */
   private feishuConfirm?: FeishuConfirm;
+  /** Bridge registry — when set, checks if a chatId has an active CLI bridge. */
+  private bridgeRegistry?: BridgeRegistry;
   private runningTasks = new Map<string, RunningTask>(); // keyed by chatId
   private messageQueues = new Map<string, IncomingMessage[]>(); // per-chatId message queue
   private pendingBatches = new Map<string, PendingBatch>(); // media debounce batches
@@ -142,6 +147,11 @@ export class MessageBridge {
   /** Inject the Feishu confirmation handler for interactive confirmation cards. */
   setFeishuConfirm(feishuConfirm: FeishuConfirm): void {
     this.feishuConfirm = feishuConfirm;
+  }
+
+  /** Inject the bridge registry for CLI bridge routing. */
+  setBridgeRegistry(registry: BridgeRegistry): void {
+    this.bridgeRegistry = registry;
   }
 
   /** Emit an activity event if a listener is registered. */
@@ -211,6 +221,23 @@ export class MessageBridge {
 
   async handleMessage(msg: IncomingMessage): Promise<void> {
     const { chatId, text } = msg;
+
+    // Check if this chatId has an active CLI bridge — forward message via API
+    if (this.bridgeRegistry?.hasBinding(chatId)) {
+      const enqueued = this.bridgeRegistry.enqueueMessage(chatId, {
+        source: 'feishu',
+        chatId,
+        userId: msg.userId,
+        text: msg.text,
+        timestamp: Date.now(),
+      });
+      if (enqueued) {
+        this.logger.info({ chatId, userId: msg.userId }, 'Message forwarded to CLI bridge');
+        return;
+      }
+      // If enqueue failed (bridge died), fall through to normal handling
+      this.logger.info({ chatId }, 'Bridge enqueue failed, falling back to SDK mode');
+    }
 
     // Handle commands (always allowed, even during pending questions)
     if (text.startsWith('/')) {
@@ -702,12 +729,25 @@ export class MessageBridge {
           const progress = pending.questions.length > 1
             ? ` (${runningTask.currentQuestionIndex + 1}/${pending.questions.length})`
             : '';
+
+          // Build terminal-visible question text with options
+          let questionDisplay = '';
+          if (currentQ) {
+            questionDisplay = `❓ ${currentQ.question}${progress}\n`;
+            if (currentQ.options && currentQ.options.length > 0) {
+              currentQ.options.forEach((opt, i) => {
+                questionDisplay += `  ${i + 1}. ${opt.label}${opt.description ? ` — ${opt.description}` : ''}\n`;
+              });
+              questionDisplay += `\n请在飞书回复选项编号或内容`;
+            }
+          }
+
           await this.sender.updateCard(messageId, {
             ...state,
             pendingQuestion: displayQuestion,
-            // Append progress indicator to response if multi-question
-            responseText: progress
-              ? (state.responseText || '') + (state.responseText ? '\n\n' : '') + `_Question${progress}_`
+            // Append question text to response for terminal visibility
+            responseText: questionDisplay
+              ? (state.responseText || '') + (state.responseText ? '\n\n' : '') + questionDisplay
               : state.responseText,
           });
 
@@ -721,9 +761,6 @@ export class MessageBridge {
             ).catch((err) => {
               this.logger.warn({ err, chatId }, 'Feishu confirmation card failed (non-fatal)');
             });
-            // Don't await — the confirmation card is for notification purposes only.
-            // The actual answer comes through the normal handleAnswer flow in the chat.
-            // We just want the push notification effect.
           }
 
           // Set/reset timeout for auto-answer
@@ -761,6 +798,32 @@ export class MessageBridge {
 
         // Throttled card update for non-final states (skip if aborted)
         if (!abortController.signal.aborted) {
+          // Check for [NEEDS CONFIRMATION] pattern in response text
+          // and send a separate Feishu confirmation card for push notification
+          const confirmMatch = state.responseText?.match(/\[NEEDS CONFIRMATION\]\n([\s\S]*?)\[\/NEEDS CONFIRMATION\]/);
+          if (confirmMatch && this.feishuConfirm && !runningTask.confirmationSent) {
+            runningTask.confirmationSent = true;
+            const questionBlock = confirmMatch[1].trim();
+            // Parse question and options from the block
+            const questionLine = questionBlock.match(/Question:\s*(.+)/)?.[1] || '';
+            const optionLines = [...questionBlock.matchAll(/^\s*(\d+)\.\s*(.+)$/gm)].map(m => m[2].trim());
+            const pendingQ: PendingQuestion = {
+              toolUseId: `text-confirm-${Date.now()}`,
+              questions: [{
+                question: questionLine,
+                header: 'Confirm',
+                options: optionLines.map(o => ({ label: o, description: '' })),
+                multiSelect: false,
+              }],
+            };
+            this.feishuConfirm.sendConfirmationAndWait(
+              chatId,
+              pendingQ,
+              { botName: this.config.name, taskPrompt: text },
+            ).catch((err) => {
+              this.logger.warn({ err, chatId }, 'Feishu confirmation card failed (non-fatal)');
+            });
+          }
           rateLimiter.schedule(() => {
             if (!abortController.signal.aborted) {
               this.sender.updateCard(messageId, state);
