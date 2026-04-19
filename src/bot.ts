@@ -2,6 +2,7 @@
 
 import { MCPServer } from './server.js';
 import type { BotConfig } from './types/index.js';
+import * as readline from 'readline';
 
 export async function startBot(config: BotConfig): Promise<void> {
   const server = new MCPServer({
@@ -15,16 +16,25 @@ export async function startBot(config: BotConfig): Promise<void> {
 
   console.error(`Bot ${config.name} starting for chatIds: ${config.chatIds.join(', ')}`);
 
-  // 监听 stdin 接收来自 Master 的消息
-  process.stdin.on('data', async (data) => {
+  // 使用 readline 正确处理 stdin 行缓冲
+  const rl = readline.createInterface({
+    input: process.stdin,
+    crlfDelay: Infinity,
+  });
+
+  rl.on('line', async (line) => {
     try {
-      const line = data.toString().trim();
-      if (!line) return;
+      if (!line.trim()) return;
       const msg = JSON.parse(line);
       await server.handleIncomingMessage(msg);
     } catch (err) {
       console.error(`Bot ${config.name} failed to process message:`, err);
     }
+  });
+
+  rl.on('close', () => {
+    console.error(`Bot ${config.name} stdin closed`);
+    process.exit(0);
   });
 
   try {
