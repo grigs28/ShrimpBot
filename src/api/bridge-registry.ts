@@ -34,8 +34,9 @@ export class BridgeRegistry {
     return this.bindings.has(chatId);
   }
 
-  /** Register a new bridge binding for the given chatId. */
-  register(chatId: string): BridgeBinding {
+  /** Register a new bridge binding for the given chatId. Returns false if already bound. */
+  register(chatId: string): boolean {
+    if (this.bindings.has(chatId)) return false;
     const now = Date.now();
     const binding: BridgeBinding = {
       chatId,
@@ -46,7 +47,7 @@ export class BridgeRegistry {
     };
     this.bindings.set(chatId, binding);
     this.logger.info({ chatId }, 'Bridge binding registered');
-    return binding;
+    return true;
   }
 
   /** Unregister a bridge binding and clean up any pending resolve. */
