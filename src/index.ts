@@ -14,59 +14,59 @@ import type { Config } from './types/index.js';
 
 // ========== CLI 参数解析 ==========
 
+// sbot 自己的参数（只解析这些，其余全部透传给 Claude）
+const SBOT_FLAGS = new Set(['--debug', '--clone', '-h', '--help']);
+const SBOT_OPTIONS = new Set(['-c', '--command', '--cwd', '--chat']); // 带值的参数
+
 interface CliArgs {
-  command?: string;       // -c "命令" → 启动后自动发送
-  cwd?: string;           // --cwd <目录>
-  chatId?: string;        // --chat <chat_id>
-  debug?: boolean;        // --debug
-  model?: string;         // --model <模型名>
-  resume?: boolean;       // --resume
-  allowedTools?: string;  // --allowedTools
-  maxTurns?: number;      // --max-turns
-  clone?: boolean;        // --clone 飞书和终端完全同步
+  command?: string;
+  cwd?: string;
+  chatId?: string;
+  debug?: boolean;
+  clone?: boolean;
+  /** 透传给 Claude Code 的参数 */
+  claudeArgs: string[];
 }
 
 function parseArgs(): CliArgs {
-  const args: CliArgs = {};
+  const args: CliArgs = { claudeArgs: [] };
   const argv = process.argv.slice(2);
 
-  for (let i = 0; i < argv.length; i++) {
+  let i = 0;
+  while (i < argv.length) {
     const arg = argv[i];
-    switch (arg) {
-      case '-c':
-      case '--command':
-        args.command = argv[++i];
-        break;
-      case '--cwd':
-        args.cwd = argv[++i];
-        break;
-      case '--chat':
-        args.chatId = argv[++i];
-        break;
-      case '--debug':
-        args.debug = true;
-        break;
-      case '--model':
-      case '-m':
-        args.model = argv[++i];
-        break;
-      case '--resume':
-        args.resume = true;
-        break;
-      case '--allowedTools':
-        args.allowedTools = argv[++i];
-        break;
-      case '--max-turns':
-        args.maxTurns = parseInt(argv[++i] || '0', 10);
-        break;
-      case '--clone':
-        args.clone = true;
-        break;
-      case '-h':
-      case '--help':
-        printHelp();
-        process.exit(0);
+
+    if (arg === '-h' || arg === '--help') {
+      printHelp();
+      process.exit(0);
     }
+
+    // sbot 带值参数
+    if (SBOT_OPTIONS.has(arg)) {
+      const value = argv[++i];
+      switch (arg) {
+        case '-c':
+        case '--command': args.command = value; break;
+        case '--cwd': args.cwd = value; break;
+        case '--chat': args.chatId = value; break;
+      }
+      i++;
+      continue;
+    }
+
+    // sbot 开关参数
+    if (SBOT_FLAGS.has(arg)) {
+      switch (arg) {
+        case '--debug': args.debug = true; break;
+        case '--clone': args.clone = true; break;
+      }
+      i++;
+      continue;
+    }
+
+    // 其他参数全部透传给 Claude
+    args.claudeArgs.push(arg);
+    i++;
   }
 
   return args;
@@ -76,41 +76,41 @@ function printHelp(): void {
   console.log(`
 sbot — 飞书 <-> Claude Code 实时通信桥
 
-用法: sbot [选项]
+用法: sbot [sbot选项] [claude选项...]
 
-选项:
+sbot 选项:
   -c, --command <文本>     启动后自动发送的命令
   --cwd <目录>             Claude Code 工作目录
   --chat <chat_id>         指定飞书会话 ID
   --debug                  开启调试日志
-  -m, --model <模型>       指定 Claude 模型
-  --resume                 恢复上次会话
-  --allowedTools <工具>    限制可用工具（逗号分隔）
-  --max-turns <数字>       最大对话轮次
   --clone                  飞书与终端完全同步（多行完整显示）
   -h, --help               显示帮助
 
+Claude 选项（全部透传给 Claude Code CLI）:
+  -m, --model <模型>       指定模型
+  --resume                 恢复上次会话
+  --allowedTools <工具>    限制可用工具
+  --max-turns <数字>       最大对话轮次
+  ... 以及 Claude Code 支持的任何其他参数
+
 示例:
-  sbot                         启动交互模式
-  sbot -c "列出文件"           启动并自动执行命令
-  sbot --cwd /my/project       指定工作目录
-  sbot --debug                 调试模式
+  sbot                                 启动交互模式
+  sbot --clone                         飞书完全同步模式
+  sbot -c "列出文件"                    启动并自动执行命令
+  sbot --cwd /tmp --model claude-opus  sbot 参数 + Claude 参数混用
+  sbot --clone -- --some-claude-flag   任意 Claude 参数都会透传
 `);
 }
 
 const cliArgs = parseArgs();
 
-// CLI 参数覆盖环境变量
+// sbot 参数 → 环境变量
 if (cliArgs.debug) process.env.LOG_LEVEL = 'debug';
 if (cliArgs.cwd) process.env.CLAUDE_CWD = cliArgs.cwd;
 if (cliArgs.chatId) process.env.FEISHU_CHAT_IDS = cliArgs.chatId;
 
-// 构建 Claude 额外参数
-const claudeExtraArgs: string[] = [];
-if (cliArgs.model) claudeExtraArgs.push('--model', cliArgs.model);
-if (cliArgs.resume) claudeExtraArgs.push('--resume');
-if (cliArgs.allowedTools) claudeExtraArgs.push('--allowedTools', cliArgs.allowedTools);
-if (cliArgs.maxTurns) claudeExtraArgs.push('--max-turns', String(cliArgs.maxTurns));
+// Claude 透传参数（CLI 的优先于环境变量的）
+const claudeExtraArgs = cliArgs.claudeArgs;
 
 /**
  * 从当前目录加载 .env 文件到 process.env
