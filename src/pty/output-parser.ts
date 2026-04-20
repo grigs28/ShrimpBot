@@ -232,16 +232,18 @@ export class OutputParser {
         // 如果包含 ● 标记，说明回复完成了
         const doneIdx = text.indexOf(DONE_MARKER);
         if (doneIdx >= 0) {
-          const cleanText = this.cleanResponseText(text.slice(doneIdx + 1).trim());
-          if (cleanText) {
-            this.lastCompleteText = cleanText;
+          // 返回累积的全部文本（包含 ● 后的最后一行）
+          const fullText = this.accumulatedText ? this.accumulatedText : text;
+          const cleanFull = this.cleanResponseText(fullText.replace(/●/g, '').trim());
+          if (cleanFull) {
+            this.lastCompleteText = cleanFull;
             this.accumulatedText = '';
             this.isWaitingInput = true;
-            return { type: 'response', text: cleanText, isComplete: true };
+            return { type: 'response', text: cleanFull, isComplete: true };
           }
         }
 
-        return { type: 'response', text, isComplete: false };
+        return { type: 'response', text: this.accumulatedText, isComplete: false };
       }
     }
 

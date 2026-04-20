@@ -16,6 +16,8 @@ export interface BridgeConfig {
   claudeExtraArgs?: string[];
   /** 自动通过 yes/no 问题 */
   autoApprove?: boolean;
+  /** clone 模式：飞书与终端完全同步，多行完整显示 */
+  clone?: boolean;
 }
 
 export class FeishuBridge {
@@ -36,6 +38,10 @@ export class FeishuBridge {
 
   /** 透传模式：stdin 是 TTY 时，直接透传 PTY 输入输出 */
   private passthrough = false;
+  /** 流式累积缓冲区：存储最新的累积文本 */
+  private streamBuffer = '';
+  /** clone 模式上次发送的文本（用于去重） */
+  private cloneLastSent = '';
 
   // 危险操作模式（阻止自动通过）
   private static readonly DANGEROUS_PATTERNS = [
@@ -227,13 +233,25 @@ export class FeishuBridge {
     if (!text.trim()) return;
 
     if (!isComplete) {
-      // 流式累积
+      // 流式累积：更新缓冲区
+      this.streamBuffer = text;
       if (this.sendTimer) clearTimeout(this.sendTimer);
-      this.sendTimer = setTimeout(() => {
-        if (text && text !== this.lastSentText) {
-          this.sendText(this.activeChatId, text);
-        }
-      }, 2000);
+
+      if (this.config.clone) {
+        // clone 模式：定期发送累积的全部文本
+        this.sendTimer = setTimeout(() => {
+          if (this.streamBuffer && this.streamBuffer !== this.cloneLastSent) {
+            this.sendCloneText(this.activeChatId, this.streamBuffer);
+          }
+        }, 2000);
+      } else {
+        // 非 clone 模式：发送当前文本
+        this.sendTimer = setTimeout(() => {
+          if (text && text !== this.lastSentText) {
+            this.sendText(this.activeChatId, text);
+          }
+        }, 2000);
+      }
       return;
     }
 
@@ -242,7 +260,6 @@ export class FeishuBridge {
 
     // yes/no → 自动通过（危险操作除外）
     if (this.config.autoApprove !== false && (isYesNo || this.isYesNoQuestion(text))) {
-      // 检查是否包含危险操作
       const isDangerous = FeishuBridge.DANGEROUS_PATTERNS.some(p => p.test(text));
       if (isDangerous) {
         logger.warn(this.tag, `检测到危险操作，阻止自动通过: "${text.slice(0, 80)}"`);
@@ -264,8 +281,13 @@ export class FeishuBridge {
       return;
     }
 
-    // 发送文本回复
-    this.sendText(this.activeChatId, text);
+    // 发送完整回复
+    if (this.config.clone) {
+      this.sendCloneText(this.activeChatId, text);
+    } else {
+      this.sendText(this.activeChatId, text);
+    }
+    this.streamBuffer = '';
 
     // 检查后面是否可能有选项，启动选项缓冲
     if (this.looksLikeQuestion(text)) {
@@ -341,6 +363,73 @@ export class FeishuBridge {
     } catch (err) {
       logger.error(this.tag, `发送飞书失败: ${err}`);
     }
+  }
+
+  /**
+   * clone 模式发送：用飞书 post + md 富文本发送完整内容
+   * 支持代码块、列表等 Markdown 格式
+   */
+  private async sendCloneText(chatId: string, text: string): Promise<void> {
+    if (text === this.cloneLastSent) return;
+    this.cloneLastSent = text;
+
+    // 飞书 post 类型限制 30KB
+    const maxBytes = 30 * 1024;
+    const encoder = new TextEncoder();
+
+    // 如果超过限制，分片发送
+    if (encoder.encode(text).length > maxBytes) {
+      const chunks = this.splitText(text, maxBytes);
+      for (const chunk of chunks) {
+        await this.sendPostMd(chatId, chunk);
+      }
+    } else {
+      await this.sendPostMd(chatId, text);
+    }
+
+    logger.info(this.tag, `飞书 ← Claude (clone): "${text.slice(0, 80)}"`);
+  }
+
+  /** 用飞书 post + md 发送 */
+  private async sendPostMd(chatId: string, text: string): Promise<void> {
+    try {
+      await this.feishuService.im.v1.message.create({
+        data: {
+          receive_id: chatId,
+          msg_type: 'post',
+          content: JSON.stringify({
+            zh_cn: {
+              content: [[{ tag: 'md', text }]],
+            },
+          }),
+        },
+        params: { receive_id_type: 'chat_id' },
+      });
+    } catch (err) {
+      logger.error(this.tag, `飞书 post 发送失败，降级为 text: ${err}`);
+      // 降级为纯文本
+      await this.sendText(chatId, text);
+    }
+  }
+
+  /** 按字节大小分片文本 */
+  private splitText(text: string, maxBytes: number): string[] {
+    const encoder = new TextEncoder();
+    const lines = text.split('\n');
+    const chunks: string[] = [];
+    let current = '';
+
+    for (const line of lines) {
+      const test = current ? `${current}\n${line}` : line;
+      if (encoder.encode(test).length > maxBytes * 0.9) {
+        if (current) chunks.push(current);
+        current = line;
+      } else {
+        current = test;
+      }
+    }
+    if (current) chunks.push(current);
+    return chunks;
   }
 
   private isYesNoQuestion(text: string): boolean {

@@ -23,6 +23,7 @@ interface CliArgs {
   resume?: boolean;       // --resume
   allowedTools?: string;  // --allowedTools
   maxTurns?: number;      // --max-turns
+  clone?: boolean;        // --clone 飞书和终端完全同步
 }
 
 function parseArgs(): CliArgs {
@@ -58,6 +59,9 @@ function parseArgs(): CliArgs {
       case '--max-turns':
         args.maxTurns = parseInt(argv[++i] || '0', 10);
         break;
+      case '--clone':
+        args.clone = true;
+        break;
       case '-h':
       case '--help':
         printHelp();
@@ -83,6 +87,7 @@ sbot — 飞书 <-> Claude Code 实时通信桥
   --resume                 恢复上次会话
   --allowedTools <工具>    限制可用工具（逗号分隔）
   --max-turns <数字>       最大对话轮次
+  --clone                  飞书与终端完全同步（多行完整显示）
   -h, --help               显示帮助
 
 示例:
@@ -179,6 +184,7 @@ async function startBridgeMode(): Promise<void> {
     claudePath: process.env.CLAUDE_PATH,
     claudeCwd: process.env.CLAUDE_CWD,
     claudeExtraArgs: extraArgs.length > 0 ? extraArgs : undefined,
+    clone: cliArgs.clone,
   });
 
   await bridge.start();
