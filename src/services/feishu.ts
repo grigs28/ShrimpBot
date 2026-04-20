@@ -1,14 +1,21 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
-import { Client } from '@larksuiteoapi/node-sdk';
-import type { FeishuMessage } from '../types/index.js';
+import * as lark from '@larksuiteoapi/node-sdk';
+import type { FeishuMessage, FeishuEvent } from '../types/index.js';
+
+const MAX_BODY_SIZE = 1024 * 1024; // 1MB 请求体限制
 
 export class FeishuService {
-  private client: Client;
+  private client: lark.Client;
   private messageHandlers: Map<string, (msg: FeishuMessage) => void> = new Map();
+  private webhookServer: http.Server | null = null;
+  private appId: string;
+  private appSecret: string;
 
   constructor(appId: string, appSecret: string) {
-    this.client = new Client({
+    this.appId = appId;
+    this.appSecret = appSecret;
+    this.client = new lark.Client({
       appId,
       appSecret,
       disableTokenCache: false,
@@ -66,7 +73,7 @@ export class FeishuService {
     if (encryptKey && encryptKey.length < 32) {
       throw new Error('Encryption key must be at least 32 characters');
     }
-    const server = http.createServer(async (req, res) => {
+    this.webhookServer = http.createServer(async (req, res) => {
       if (req.method === 'GET') {
         // 飞书验证 URL
         const reqUrl = req.url || '/';
@@ -81,7 +88,20 @@ export class FeishuService {
 
       if (req.method === 'POST') {
         let body = '';
-        req.on('data', chunk => { body += chunk; });
+        let bodySize = 0;
+        req.on('data', chunk => {
+          bodySize += chunk.length;
+          if (bodySize > MAX_BODY_SIZE) {
+            res.writeHead(413, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Request body too large' }));
+            req.destroy();
+            return;
+          }
+          body += chunk;
+        });
+        req.on('error', (err) => {
+          console.error('Request error:', err.message);
+        });
         req.on('end', async () => {
           try {
             // 解析 JSON
@@ -96,7 +116,12 @@ export class FeishuService {
               );
               let decrypted = decipher.update(event.encrypt, 'base64', 'utf8');
               decrypted += decipher.final('utf8');
-              Object.assign(event, JSON.parse(decrypted));
+              // 安全合并：避免 Object.assign 原型污染
+              const decryptedData = JSON.parse(decrypted) as Record<string, unknown>;
+              for (const key of Object.keys(decryptedData)) {
+                if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
+                (event as any)[key] = decryptedData[key];
+              }
             }
 
             // 处理消息事件
@@ -108,8 +133,10 @@ export class FeishuService {
             res.end('ok');
           } catch (err) {
             console.error('Webhook 处理失败:', err);
-            res.writeHead(500);
-            res.end('error');
+            if (!res.headersSent) {
+              res.writeHead(500);
+              res.end('error');
+            }
           }
         });
         return;
@@ -119,13 +146,73 @@ export class FeishuService {
       res.end();
     });
 
-    server.listen(port, () => {
+    this.webhookServer.listen(port, () => {
       console.error(`Webhook 服务器已启动，监听端口 ${port}`);
     });
   }
 
+  // 停止 Webhook 服务器
+  stopWebhook(): void {
+    if (this.webhookServer) {
+      this.webhookServer.close();
+      this.webhookServer = null;
+    }
+  }
+
+  // 通过 WebSocket 长连接接收实时消息
+  startWSClient(onMessage: (event: FeishuEvent) => void): void {
+    const dispatcher = new lark.EventDispatcher({});
+
+    dispatcher.register({
+      'im.message.receive_v1': async (data: any) => {
+        try {
+          const msg = data.message;
+          const sender = data.sender;
+          if (!msg) return;
+
+          const event: FeishuEvent = {
+            chatId: msg.chat_id,
+            chatType: msg.chat_type || 'p2p',
+            userId: sender?.sender_id?.open_id || '',
+            messageId: msg.message_id,
+            text: this.parseMessageContent(msg.message_type, msg.content),
+            messageType: msg.message_type || 'text',
+            timestamp: Date.now(),
+          };
+          onMessage(event);
+        } catch (err) {
+          console.error('WSClient message parse error:', err);
+        }
+      },
+    });
+
+    const wsClient = new lark.WSClient({
+      appId: this.appId,
+      appSecret: this.appSecret,
+      loggerLevel: lark.LoggerLevel.info,
+    });
+
+    wsClient.start({ eventDispatcher: dispatcher });
+    console.error('WSClient WebSocket 连接已启动');
+  }
+
+  // 解析飞书消息内容
+  private parseMessageContent(messageType: string, content: string): string {
+    if (!content) return '';
+    try {
+      const parsed = JSON.parse(content);
+      if (messageType === 'text') {
+        return parsed.text || '';
+      }
+      // 富文本等其他类型提取纯文本
+      return parsed.text || content;
+    } catch {
+      return content;
+    }
+  }
+
   // 获取飞书 SDK Client 实例
-  getClient(): Client {
+  getClient(): lark.Client {
     return this.client;
   }
 }

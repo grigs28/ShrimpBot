@@ -29,4 +29,12 @@ export const TOOLS = [
       properties: {},
     },
   },
+  {
+    name: 'check_messages',
+    description: '检查飞书缓冲区中的新消息并清空缓冲区',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
 ];

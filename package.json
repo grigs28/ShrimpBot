@@ -5,16 +5,20 @@
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "claude-code-channels-feishu": "./dist/index.js"
+    "sbot": "./dist/index.js"
   },
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsc && node dist/index.js"
+    "dev": "tsc && node dist/index.js",
+    "test": "vitest run --exclude '**/e2e*'",
+    "test:e2e": "vitest run src/pty/__tests__/e2e-pty.test.ts"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.58.0",
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "node-pty": "^1.0.0",
+    "strip-ansi": "^7.2.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

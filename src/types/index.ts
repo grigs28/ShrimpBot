@@ -41,3 +41,14 @@ export interface BotConfig {
 export interface MultiBotConfig {
   bots: BotConfig[];
 }
+
+// 飞书实时事件
+export interface FeishuEvent {
+  chatId: string;
+  chatType: 'p2p' | 'group';
+  userId: string;
+  messageId: string;
+  text: string;
+  messageType: string;
+  timestamp: number;
+}

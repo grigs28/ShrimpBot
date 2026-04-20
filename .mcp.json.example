@@ -1,10 +1,10 @@
 {
   "bots": [
     {
-      "name": "小虾虾",
-      "appId": "cli_a9474d2ef5781bce",
-      "appSecret": "9B0ATvRNCn9wguH3HrjkXbYlLOTm6MKy",
-      "chatIds": ["oc_248b4d3d66e287eabb96f9a76cf54daa"]
+      "name": "your-bot-name",
+      "appId": "your-app-id",
+      "appSecret": "your-app-secret",
+      "chatIds": ["oc_your_chat_id"]
     }
   ]
 }

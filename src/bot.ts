@@ -5,12 +5,14 @@ import type { BotConfig } from './types/index.js';
 import * as readline from 'readline';
 
 export async function startBot(config: BotConfig): Promise<void> {
+  const port = parseInt(process.env.FEISHU_WEBHOOK_PORT || '0', 10);
+
   const server = new MCPServer({
     feishuAppId: config.appId,
     feishuAppSecret: config.appSecret,
     botName: config.name,
     chatIds: config.chatIds,
-    webhookPort: 8080,
+    webhookPort: port,
     debug: process.env.DEBUG === 'true',
   });
 

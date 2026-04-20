@@ -1,8 +1,12 @@
 import type { FeishuService } from '../services/feishu.js';
+import type { MCPServer } from '../server.js';
 import { TOOLS } from '../capabilities.js';
 
 export class ToolsHandler {
-  constructor(private feishuService: FeishuService) {}
+  constructor(
+    private feishuService: FeishuService,
+    private mcpServer: MCPServer,
+  ) {}
 
   // 返回工具列表
   listTools() {
@@ -24,6 +28,8 @@ export class ToolsHandler {
         return this.sendMessage(args.chat_id, args.text);
       case 'list_chats':
         return this.listChats();
+      case 'check_messages':
+        return this.checkMessages();
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
@@ -49,5 +55,20 @@ export class ToolsHandler {
       console.error('获取会话列表失败:', err);
       return { chats: [] };
     }
+  }
+
+  private checkMessages(): any {
+    const messages = this.mcpServer.drainMessages();
+    return {
+      count: messages.length,
+      messages: messages.map(m => ({
+        chat_id: m.chatId,
+        user_id: m.userId,
+        message_id: m.messageId,
+        text: m.text,
+        type: m.messageType,
+        timestamp: m.timestamp,
+      })),
+    };
   }
 }

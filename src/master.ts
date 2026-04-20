@@ -9,6 +9,8 @@ interface RestartRecord {
   firstAttempt: number;
 }
 
+const MAX_BODY_SIZE = 1024 * 1024; // 1MB 请求体限制
+
 export class Master {
   private botProcesses: Map<string, ChildProcess> = new Map();
   private pendingRestarts: Map<string, ReturnType<typeof setTimeout>> = new Map();
@@ -29,7 +31,20 @@ export class Master {
     this.routerServer = http.createServer(async (req, res) => {
       if (req.method === 'POST' && req.url === '/route') {
         let body = '';
-        req.on('data', chunk => { body += chunk; });
+        let bodySize = 0;
+        req.on('data', chunk => {
+          bodySize += chunk.length;
+          if (bodySize > MAX_BODY_SIZE) {
+            res.writeHead(413, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Request body too large' }));
+            req.destroy();
+            return;
+          }
+          body += chunk;
+        });
+        req.on('error', (err) => {
+          console.error('Request error:', err.message);
+        });
         req.on('end', async () => {
           try {
             const { chat_id, content } = JSON.parse(body);
@@ -74,10 +89,8 @@ export class Master {
 
     // 启动 HTTP 路由服务器
     const port = parseInt(process.env.FEISHU_ROUTER_PORT || '9090', 10);
-    this.routerServer.listen(port, () => {
-      console.error(`Router server listening on port ${port}`);
-    });
 
+    // 先注册错误处理再监听
     this.routerServer.on('error', (err) => {
       if ((err as any).code === 'EADDRINUSE') {
         console.error(`Port ${port} is already in use`);
@@ -85,6 +98,10 @@ export class Master {
         console.error(`Router server error: ${err.message}`);
       }
       process.exit(1);
+    });
+
+    this.routerServer.listen(port, () => {
+      console.error(`Router server listening on port ${port}`);
     });
 
     console.error('Master started with', this.config.bots.length, 'bots');
@@ -114,22 +131,20 @@ export class Master {
       console.error(`Bot ${bot.name} failed to start: ${err.message}`);
     });
 
-    child.on('exit', (code) => {
-      if (code !== 0) {
+    // 通过 IPC 通道发送凭据（避免环境变量泄露）
+    child.send({ type: 'credentials', appId: bot.appId, appSecret: bot.appSecret });
+
+    child.on('exit', (code, signal) => {
+      // 被信号杀死时 code 为 null，也需要重启
+      if (code !== 0 || signal !== null) {
         const now = Date.now();
-        const lastRestart = this.botRestartCounts.get(bot.name) || { count: 0, firstAttempt: now };
+        const prev = this.botRestartCounts.get(bot.name);
+        const firstAttempt = (!prev || now - prev.firstAttempt > this.RESTART_WINDOW_MS) ? now : prev.firstAttempt;
+        const count = (!prev || now - prev.firstAttempt > this.RESTART_WINDOW_MS) ? 1 : prev.count + 1;
+        this.botRestartCounts.set(bot.name, { count, firstAttempt });
 
-        if (now - lastRestart.firstAttempt > this.RESTART_WINDOW_MS) {
-          // 重启窗口过期，重置计数
-          lastRestart.count = 0;
-          lastRestart.firstAttempt = now;
-        }
-
-        lastRestart.count++;
-        this.botRestartCounts.set(bot.name, lastRestart);
-
-        if (lastRestart.count <= this.MAX_RESTART_ATTEMPTS) {
-          console.error(`Bot ${bot.name} exited with code ${code}, restarting (${lastRestart.count}/${this.MAX_RESTART_ATTEMPTS})...`);
+        if (count <= this.MAX_RESTART_ATTEMPTS) {
+          console.error(`Bot ${bot.name} exited with code ${code} signal ${signal}, restarting (${count}/${this.MAX_RESTART_ATTEMPTS})...`);
           const timeout = setTimeout(() => this.startBotProcess(bot), 1000);
           this.pendingRestarts.set(bot.name, timeout);
         } else {
@@ -159,12 +174,19 @@ export class Master {
     // 关闭 HTTP 服务器
     this.routerServer.close();
 
-    // 终止所有进程
+    // 优雅终止所有进程
     const botNames = Array.from(this.botProcesses.keys());
     for (const name of botNames) {
       const proc = this.botProcesses.get(name);
       if (proc) {
-        proc.kill();
+        proc.kill(); // SIGTERM
+        const forceKill = setTimeout(() => {
+          try { proc.kill('SIGKILL'); } catch {}
+        }, 5000);
+        proc.on('exit', () => {
+          clearTimeout(forceKill);
+          this.botProcesses.delete(name);
+        });
         this.botProcesses.delete(name);
       }
     }
