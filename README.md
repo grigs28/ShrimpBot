@@ -33,26 +33,32 @@ CLAUDE_CWD=/path/to/project
 ## CLI 参数 / CLI Options
 
 ```
-sbot [选项 / options]
+sbot [sbot选项 / sbot options] [claude选项... / claude options...]
 
-  -c, --command <text>     启动后自动执行的命令 / command to run after startup
+sbot 参数（sbot 消费，不传给 Claude）：
+  -c, --command <text>     启动后自动执行的命令 / run command after startup
   --cwd <dir>              工作目录 / working directory
   --chat <chat_id>         飞书会话 ID / Feishu chat ID
   --debug                  调试模式 / debug mode
-  -m, --model <model>      指定模型 / specify model
-  --resume                 恢复会话 / resume previous session
-  --allowedTools <tools>   限制工具 / restrict tools (comma-separated)
-  --max-turns <n>          最大轮次 / max conversation turns
+  --clone                  飞书与终端完全同步 / full Feishu sync
   -h, --help               帮助 / help
+
+Claude 参数（全部透传给 Claude Code CLI）：
+  -m, --model              指定模型 / specify model
+  --resume                 恢复会话 / resume session
+  --allowedTools           限制工具 / restrict tools
+  --max-turns              最大轮次 / max turns
+  ... 以及 Claude Code 支持的任何参数 / any Claude Code flag
 ```
 
 **示例 / Examples:**
 
 ```bash
-sbot                              # 交互模式 / interactive mode
-sbot -c "列出文件"                 # 自动执行 / auto-run command
-sbot --cwd /my/project            # 指定目录 / specify directory
-sbot --debug                      # 调试 / debug mode
+sbot                                      # 交互模式 / interactive mode
+sbot --clone                              # 飞书完全同步 / full Feishu sync
+sbot -c "列出文件"                         # 自动执行 / auto-run command
+sbot --cwd /tmp --model claude-opus       # sbot + Claude 参数混用 / mixed args
+sbot --clone -m opus --resume             # 顺序随意 / any order
 ```
 
 ## 双端交互 / Dual-Side Interaction
