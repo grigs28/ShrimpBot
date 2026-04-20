@@ -8,9 +8,9 @@
     "sbot": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && npm link",
     "start": "node dist/index.js",
-    "dev": "tsc && node dist/index.js",
+    "dev": "tsc && npm link && node dist/index.js",
     "test": "vitest run --exclude '**/e2e*'",
     "test:e2e": "vitest run src/pty/__tests__/e2e-pty.test.ts"
   },

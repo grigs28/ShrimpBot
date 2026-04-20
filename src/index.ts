@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 // src/index.ts
 
 import * as fs from 'fs';
@@ -10,6 +11,101 @@ import { FeishuBridge } from './pty/feishu-bridge.js';
 import { setupWizard } from './setup.js';
 import { logger } from './logger.js';
 import type { Config } from './types/index.js';
+
+// ========== CLI 参数解析 ==========
+
+interface CliArgs {
+  command?: string;       // -c "命令" → 启动后自动发送
+  cwd?: string;           // --cwd <目录>
+  chatId?: string;        // --chat <chat_id>
+  debug?: boolean;        // --debug
+  model?: string;         // --model <模型名>
+  resume?: boolean;       // --resume
+  allowedTools?: string;  // --allowedTools
+  maxTurns?: number;      // --max-turns
+}
+
+function parseArgs(): CliArgs {
+  const args: CliArgs = {};
+  const argv = process.argv.slice(2);
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    switch (arg) {
+      case '-c':
+      case '--command':
+        args.command = argv[++i];
+        break;
+      case '--cwd':
+        args.cwd = argv[++i];
+        break;
+      case '--chat':
+        args.chatId = argv[++i];
+        break;
+      case '--debug':
+        args.debug = true;
+        break;
+      case '--model':
+      case '-m':
+        args.model = argv[++i];
+        break;
+      case '--resume':
+        args.resume = true;
+        break;
+      case '--allowedTools':
+        args.allowedTools = argv[++i];
+        break;
+      case '--max-turns':
+        args.maxTurns = parseInt(argv[++i] || '0', 10);
+        break;
+      case '-h':
+      case '--help':
+        printHelp();
+        process.exit(0);
+    }
+  }
+
+  return args;
+}
+
+function printHelp(): void {
+  console.log(`
+sbot — 飞书 <-> Claude Code 实时通信桥
+
+用法: sbot [选项]
+
+选项:
+  -c, --command <文本>     启动后自动发送的命令
+  --cwd <目录>             Claude Code 工作目录
+  --chat <chat_id>         指定飞书会话 ID
+  --debug                  开启调试日志
+  -m, --model <模型>       指定 Claude 模型
+  --resume                 恢复上次会话
+  --allowedTools <工具>    限制可用工具（逗号分隔）
+  --max-turns <数字>       最大对话轮次
+  -h, --help               显示帮助
+
+示例:
+  sbot                         启动交互模式
+  sbot -c "列出文件"           启动并自动执行命令
+  sbot --cwd /my/project       指定工作目录
+  sbot --debug                 调试模式
+`);
+}
+
+const cliArgs = parseArgs();
+
+// CLI 参数覆盖环境变量
+if (cliArgs.debug) process.env.LOG_LEVEL = 'debug';
+if (cliArgs.cwd) process.env.CLAUDE_CWD = cliArgs.cwd;
+if (cliArgs.chatId) process.env.FEISHU_CHAT_IDS = cliArgs.chatId;
+
+// 构建 Claude 额外参数
+const claudeExtraArgs: string[] = [];
+if (cliArgs.model) claudeExtraArgs.push('--model', cliArgs.model);
+if (cliArgs.resume) claudeExtraArgs.push('--resume');
+if (cliArgs.allowedTools) claudeExtraArgs.push('--allowedTools', cliArgs.allowedTools);
+if (cliArgs.maxTurns) claudeExtraArgs.push('--max-turns', String(cliArgs.maxTurns));
 
 /**
  * 从当前目录加载 .env 文件到 process.env
@@ -68,6 +164,12 @@ async function startBridgeMode(): Promise<void> {
     chatIds = config.chatIds;
   }
 
+  // 合并 CLI 参数和环境变量的额外参数
+  const extraArgs = [
+    ...(process.env.CLAUDE_EXTRA_ARGS?.split(' ').filter(Boolean) || []),
+    ...claudeExtraArgs,
+  ];
+
   const bridge = new FeishuBridge({
     feishuAppId: appId,
     feishuAppSecret: appSecret,
@@ -76,10 +178,18 @@ async function startBridgeMode(): Promise<void> {
     allowedUsers,
     claudePath: process.env.CLAUDE_PATH,
     claudeCwd: process.env.CLAUDE_CWD,
-    claudeExtraArgs: process.env.CLAUDE_EXTRA_ARGS?.split(' ').filter(Boolean),
+    claudeExtraArgs: extraArgs.length > 0 ? extraArgs : undefined,
   });
 
   await bridge.start();
+
+  // -c 初始命令：启动后自动发送
+  if (cliArgs.command) {
+    setTimeout(() => {
+      logger.info('Main', `执行初始命令: "${cliArgs.command}"`);
+      bridge.sendInitialCommand(cliArgs.command!);
+    }, 3000);
+  }
 
   process.on('SIGINT', () => {
     logger.info('Main', '收到 SIGINT，关闭...');

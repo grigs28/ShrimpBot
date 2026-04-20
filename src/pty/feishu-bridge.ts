@@ -75,7 +75,9 @@ export class FeishuBridge {
       } else if (event.type === 'question') {
         this.handleQuestion(event.options);
       } else if (event.type === 'exit') {
-        logger.error(this.tag, `Claude PTY 退出: code=${event.code}`);
+        logger.info(this.tag, `Claude PTY 退出: code=${event.code}，关闭 Bridge`);
+        this.stop();
+        process.exit(event.code || 0);
       }
     });
   }
@@ -145,11 +147,17 @@ export class FeishuBridge {
       process.stdout.write(data);
     });
 
-    // 2. 终端 stdin → PTY（raw 模式，逐字节转发）
+    // 2. 终端 stdin → PTY（raw 模式，拦截 Ctrl+C / Ctrl+D 退出）
     process.stdin.setRawMode(true);
     process.stdin.resume();
     process.stdin.on('data', (data: Buffer) => {
-      this.pty.writeRaw(data.toString());
+      const input = data.toString();
+      // Ctrl+C (0x03) 或 Ctrl+D (0x04) → 退出 bridge
+      if (input === '\x03' || input === '\x04') {
+        this.stop();
+        process.exit(0);
+      }
+      this.pty.writeRaw(input);
     });
 
     // 3. 终端大小变化 → PTY resize
@@ -160,6 +168,17 @@ export class FeishuBridge {
     process.stdout.on('resize', resize);
 
     logger.info(this.tag, '透传模式已启用：终端直接显示 Claude Code TUI');
+  }
+
+  /**
+   * 发送初始命令（-c 参数），透传模式用 writeRaw，否则用 send
+   */
+  sendInitialCommand(command: string): void {
+    if (this.passthrough) {
+      this.pty.writeRaw(command + '\r');
+    } else {
+      this.pty.send(command);
+    }
   }
 
   // ========== 飞书 → Claude ==========
