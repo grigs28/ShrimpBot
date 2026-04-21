@@ -153,8 +153,7 @@ export class FeishuBridge {
   }
 
   sendInitialCommand(command: string): void {
-    if (this.passthrough) { this.pty.writeRaw(command + '\r'); }
-    else { this.pty.send(command); }
+    this.sendToPty(command);
   }
 
   // ========== 飞书 → Claude ==========
@@ -231,9 +230,14 @@ export class FeishuBridge {
     }, 120_000);
   }
 
-  /** 飞书消息统一走 send（重置 parser），终端直输走 writeRaw */
+  /**
+   * 飞书消息发送到 Claude Code PTY
+   * 文本和回车必须分开发：Claude Code TUI 检测到粘贴时，
+   * 连在一起的 \r 会被当作粘贴内容而非提交键
+   */
   private sendToPty(text: string): void {
-    this.pty.send(text);
+    this.pty.resetAndWrite(text);
+    setTimeout(() => { this.pty.writeRaw('\r'); }, 300);
   }
 
   private processQueue(): void {

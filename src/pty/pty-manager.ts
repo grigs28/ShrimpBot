@@ -108,6 +108,14 @@ export class PTYManager {
     logger.info(this.tag, `← 发送: "${message.slice(0, 100)}"`);
   }
 
+  /** 重置 parser 并写入文本（不带 \r），回车由调用方延迟单独发送 */
+  resetAndWrite(text: string): void {
+    if (!this.pty || !this.running) return;
+    this.parser.markNewRound();
+    this.pty.write(text);
+    logger.info(this.tag, `← 写入文本: "${text.slice(0, 100)}"`);
+  }
+
   onEvent(listener: (event: PTYEvent) => void): void {
     this.listeners.push(listener);
   }
