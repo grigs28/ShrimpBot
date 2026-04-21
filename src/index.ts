@@ -2,6 +2,7 @@
 // src/index.ts
 
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { MCPServer } from './server.js';
 import { loadMultiBotConfig, loadSingleBotConfig } from './config.js';
@@ -16,7 +17,7 @@ import type { Config } from './types/index.js';
 
 // sbot 自己的参数（只解析这些，其余全部透传给 Claude）
 const SBOT_FLAGS = new Set(['--debug', '--clone', '-h', '--help']);
-const SBOT_OPTIONS = new Set(['-c', '--command', '--cwd', '--chat']); // 带值的参数
+const SBOT_OPTIONS = new Set(['-c', '--command', '--cwd', '--chat', '--app-id', '--app-secret', '--name']);
 
 interface CliArgs {
   command?: string;
@@ -24,12 +25,17 @@ interface CliArgs {
   chatId?: string;
   debug?: boolean;
   clone?: boolean;
+  appId?: string;
+  appSecret?: string;
+  name?: string;
+  /** 是否是 init 子命令 */
+  isInit: boolean;
   /** 透传给 Claude Code 的参数 */
   claudeArgs: string[];
 }
 
 function parseArgs(): CliArgs {
-  const args: CliArgs = { claudeArgs: [] };
+  const args: CliArgs = { isInit: false, claudeArgs: [] };
   const argv = process.argv.slice(2);
 
   let i = 0;
@@ -41,6 +47,13 @@ function parseArgs(): CliArgs {
       process.exit(0);
     }
 
+    // init 子命令
+    if (arg === 'init') {
+      args.isInit = true;
+      i++;
+      continue;
+    }
+
     // sbot 带值参数
     if (SBOT_OPTIONS.has(arg)) {
       const value = argv[++i];
@@ -49,6 +62,9 @@ function parseArgs(): CliArgs {
         case '--command': args.command = value; break;
         case '--cwd': args.cwd = value; break;
         case '--chat': args.chatId = value; break;
+        case '--app-id': args.appId = value; break;
+        case '--app-secret': args.appSecret = value; break;
+        case '--name': args.name = value; break;
       }
       i++;
       continue;
@@ -76,7 +92,10 @@ function printHelp(): void {
   console.log(`
 sbot — 飞书 <-> Claude Code 实时通信桥
 
-用法: sbot [sbot选项] [claude选项...]
+用法: sbot [命令] [sbot选项] [claude选项...]
+
+命令:
+  init                     初始化配置（交互式或参数式）
 
 sbot 选项:
   -c, --command <文本>     启动后自动发送的命令
@@ -86,19 +105,26 @@ sbot 选项:
   --clone                  飞书与终端完全同步（多行完整显示）
   -h, --help               显示帮助
 
+init 选项:
+  --app-id <id>            飞书 App ID
+  --app-secret <secret>    飞书 App Secret
+  --name <名称>            Bot 名称
+  --chat <chat_id>         飞书会话 ID
+
 Claude 选项（全部透传给 Claude Code CLI）:
-  -m, --model <模型>       指定模型
+  -m, --model              指定模型
   --resume                 恢复上次会话
-  --allowedTools <工具>    限制可用工具
-  --max-turns <数字>       最大对话轮次
-  ... 以及 Claude Code 支持的任何其他参数
+  --allowedTools           限制可用工具
+  --max-turns              最大对话轮次
+  ... 以及 Claude Code 支持的任何参数
 
 示例:
   sbot                                 启动交互模式
+  sbot init                            交互式初始化
+  sbot init --app-id cli_xxx --app-secret yyy --name "小虾虾"
   sbot --clone                         飞书完全同步模式
   sbot -c "列出文件"                    启动并自动执行命令
   sbot --cwd /tmp --model claude-opus  sbot 参数 + Claude 参数混用
-  sbot --clone -- --some-claude-flag   任意 Claude 参数都会透传
 `);
 }
 
@@ -210,7 +236,82 @@ async function startBridgeMode(): Promise<void> {
   });
 }
 
+/**
+ * sbot init：初始化配置
+ * 支持 --app-id / --app-secret / --name 参数（非交互式）
+ * 或无参数时进入交互式向导
+ */
+async function handleInit(): Promise<void> {
+  console.log('🦐 ShrimpBot — 初始化配置\n');
+
+  let appId = cliArgs.appId;
+  let appSecret = cliArgs.appSecret;
+  let name = cliArgs.name || 'ShrimpBot';
+  let chatIds = cliArgs.chatId ? [cliArgs.chatId] : [] as string[];
+
+  // 参数不全 → 交互式向导
+  if (!appId || !appSecret) {
+    const config = await setupWizard();
+    appId = config.feishuAppId;
+    appSecret = config.feishuAppSecret;
+    chatIds = config.chatIds;
+  } else {
+    // 参数完整 → 写入 bots.json（按 app-id 判断新增或更新）
+    const botsPath = path.join(os.homedir(), '.shrimpbot', 'bots.json');
+    let bots: Array<{ name: string; appId: string; appSecret: string }> = [];
+    if (fs.existsSync(botsPath)) {
+      try { bots = JSON.parse(fs.readFileSync(botsPath, 'utf-8')); } catch { /* ignore */ }
+    }
+
+    const existing = bots.find(b => b.appId === appId);
+    if (existing) {
+      // 已有 → 更新 name 和 appSecret
+      if (appSecret) existing.appSecret = appSecret;
+      if (cliArgs.name) existing.name = name;
+      console.log(`✅ 已更新 Bot "${existing.name}" (${appId})`);
+    } else {
+      // 没有 → 添加
+      bots.push({ name, appId, appSecret });
+      console.log(`✅ 已添加 Bot "${name}" (${appId})`);
+    }
+
+    const dir = path.dirname(botsPath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(botsPath, JSON.stringify(bots, null, 2));
+    console.log(`   保存到 ${botsPath}`);
+
+    // 写 .env
+    const envLines = [
+      'FEISHU_MODE=bridge',
+      `FEISHU_APP_ID=${appId}`,
+      `FEISHU_APP_SECRET=${appSecret}`,
+      `FEISHU_CHAT_IDS=${chatIds.join(',')}`,
+      `FEISHU_BOT_NAME=${name}`,
+    ];
+    const envPath = path.join(process.cwd(), '.env');
+    fs.writeFileSync(envPath, envLines.join('\n') + '\n');
+    console.log(`✅ 已保存配置到 ${envPath}`);
+
+    // 写入环境变量供当前进程使用
+    process.env.FEISHU_APP_ID = appId;
+    process.env.FEISHU_APP_SECRET = appSecret;
+    process.env.FEISHU_CHAT_IDS = chatIds.join(',');
+    process.env.FEISHU_BOT_NAME = name;
+  }
+
+  // init 后直接启动 bridge
+  console.log('\n🚀 配置完成，正在启动 Bridge...\n');
+  process.env.FEISHU_MODE = 'bridge';
+  await startBridgeMode();
+}
+
 async function main() {
+  // sbot init 子命令：初始化配置后直接启动
+  if (cliArgs.isInit) {
+    await handleInit();
+    return;
+  }
+
   const mode = process.env.FEISHU_MODE || 'single';
 
   if (mode === 'bridge') {
