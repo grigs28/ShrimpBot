@@ -45,6 +45,7 @@ export class FeishuBridge {
 
   private messageQueue: Array<{ event: FeishuEvent; text: string }> = [];
   private claudeBusy = false;
+  private busyTimer: ReturnType<typeof setTimeout> | null = null;
 
   private responseChatId = '';
   private defaultChatId = '';
@@ -219,15 +220,25 @@ export class FeishuBridge {
     // 新一轮：重置增量发送状态
     this.lastSentTextMap.delete(event.chatId);
     this.sendToPty(text);
+
+    // 安全超时：120 秒无完成响应则强制解除阻塞
+    if (this.busyTimer) clearTimeout(this.busyTimer);
+    this.busyTimer = setTimeout(() => {
+      if (this.claudeBusy) {
+        logger.warn(this.tag, '⏰ 响应超时（120s），强制解除 claudeBusy');
+        this.processQueue();
+      }
+    }, 120_000);
   }
 
+  /** 飞书消息统一走 send（重置 parser），终端直输走 writeRaw */
   private sendToPty(text: string): void {
-    if (this.passthrough) { this.pty.writeRaw(text + '\r'); }
-    else { this.pty.send(text); }
+    this.pty.send(text);
   }
 
   private processQueue(): void {
     this.claudeBusy = false;
+    if (this.busyTimer) { clearTimeout(this.busyTimer); this.busyTimer = null; }
     if (this.messageQueue.length === 0) return;
 
     const item = this.messageQueue.shift()!;
@@ -492,6 +503,7 @@ export class FeishuBridge {
   stop(): void {
     if (this.sendTimer) { clearTimeout(this.sendTimer); this.sendTimer = null; }
     if (this.optionTimer) { clearTimeout(this.optionTimer); this.optionTimer = null; }
+    if (this.busyTimer) { clearTimeout(this.busyTimer); this.busyTimer = null; }
     this.pendingOptions = [];
     this.waitingForAnswer = false;
     this.messageQueue = [];
