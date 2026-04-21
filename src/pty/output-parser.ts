@@ -35,21 +35,22 @@ const NOISE_PATTERNS = [
   /^[a-z]{1,3}…$/,     // 短字母 + 省略号（如 ng… g…）
 ];
 
-// Yes/No 自动通过模式
-const YES_NO_PATTERNS = [
+// Yes/No 权限确认模式（参考 claude-monitor 逻辑，要求 prompt + options 同时出现）
+// 仅匹配 Claude Code 的权限确认提示，不匹配 Claude 的对话式提问
+const PERM_PATTERNS = [
+  /requires approval/i,
+  /do you want/i,
+  /proceed/i,
   /\?\s*\[y\/n\]/i,
   /\?\s*\[Y\/n\]/,
   /\(yes\/no\)/i,
   /\(y\/n\)/i,
-  /proceed\?/i,
-  /continue\?/i,
-  /confirm\?/i,
-  /allow\?/i,
-  /approve\?/i,
-  /是否/i,
-  /确认/i,
-  /继续/i,
 ];
+
+// 权限选项关键词
+const PERM_OPTION_YES = /\byes\b/i;
+const PERM_OPTION_NO = /\bno\b/i;
+const PERM_OPTION_ALWAYS = [/\balways\b/i, /don'?t ask/i];
 
 // 选项模式（数字编号的选项，数字和点后面可选空格，内容不超过 50 字）
 const OPTION_PATTERN = /^\s*(\d{1,2})\.\s*(.{1,50})$/;
@@ -189,8 +190,13 @@ export class OutputParser {
         this.accumulatedText = '';
         this.isWaitingInput = true;
 
-        // 检查是否是 yes/no 问题
-        const isYesNo = YES_NO_PATTERNS.some(p => p.test(cleanText));
+        // 检查是否是权限确认提示（参考 claude-monitor：prompt + options 同时存在）
+        const hasPermPrompt = PERM_PATTERNS.some(p => p.test(cleanText));
+        const hasYes = PERM_OPTION_YES.test(cleanText);
+        const hasNo = PERM_OPTION_NO.test(cleanText);
+        const hasAlways = PERM_OPTION_ALWAYS.some(p => p.test(cleanText));
+        const hasPermOptions = (hasYes && hasNo) || hasAlways;
+        const isYesNo = hasPermPrompt && hasPermOptions;
 
         return {
           type: 'response',

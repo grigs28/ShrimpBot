@@ -213,6 +213,12 @@ export class FeishuBridge {
   // ========== 飞书 → Claude ==========
 
   private handleFeishuMessage(event: FeishuEvent): void {
+    // 注册已知会话（始终记录，在过滤之前）
+    this.registerChat(event);
+
+    // 自动保存新 chatId 到 .env 并加入白名单
+    this.saveChatId(event.chatId);
+
     // 过滤不在白名单中的会话
     if (this.config.chatIds.length > 0 && !this.config.chatIds.includes(event.chatId)) {
       return;
@@ -222,12 +228,6 @@ export class FeishuBridge {
       logger.warn(this.tag, `忽略未授权用户: ${event.userId}`);
       return;
     }
-
-    // 注册/更新已知会话
-    this.registerChat(event);
-
-    // 自动保存新 chatId 到 .env
-    this.saveChatId(event.chatId);
 
     const text = event.text.trim();
     if (!text) return;
@@ -339,11 +339,15 @@ export class FeishuBridge {
 
     if (this.sendTimer) clearTimeout(this.sendTimer);
 
-    // yes/no → 自动通过
-    if (this.config.autoApprove !== false && (isYesNo || this.isYesNoQuestion(text))) {
+    // 先检测是否包含编号选项（如果有选项，不自动通过）
+    const hasOptions = this.containsNumberedOptions(text);
+
+    // yes/no → 自动通过（仅当没有编号选项时）
+    if (!hasOptions && this.config.autoApprove !== false && (isYesNo || this.isYesNoQuestion(text))) {
       const isDangerous = FeishuBridge.DANGEROUS_PATTERNS.some(p => p.test(text));
       if (isDangerous) {
         logger.warn(this.tag, `检测到危险操作，阻止自动通过: "${text.slice(0, 80)}"`);
+        // 危险操作：两端显示，等待手动确认
         this.sendText(targetChatId, `⚠️ 检测到潜在危险操作，需要手动确认：\n${text}`);
         this.waitingForAnswer = true;
         if (!this.passthrough) {
@@ -352,17 +356,24 @@ export class FeishuBridge {
         return;
       }
 
+      // 自动通过：两端都显示
       logger.info(this.tag, `自动通过 yes/no: "${text.slice(0, 80)}"`);
+      const approveMsg = `[自动通过] ${text}\n→ 已自动回复 yes`;
+      // 发到飞书
+      this.sendText(targetChatId, approveMsg);
+      // 发到终端（透传模式下 TUI 自己会显示，非透传模式需要手动显示）
+      if (!this.passthrough) {
+        fs.writeSync(2, `\x1b[36m${approveMsg}\x1b[0m\n`);
+      }
       setTimeout(() => {
         if (this.pty.isRunning()) {
           this.pty.send('yes');
         }
       }, 500);
-      this.sendText(targetChatId, `[自动通过] ${text}\n→ 已自动回复 yes`);
       return;
     }
 
-    // 发送完整回复
+    // 发送完整回复（双端显示）
     if (this.config.clone) {
       this.sendCloneText(targetChatId, text);
     } else {
@@ -370,7 +381,7 @@ export class FeishuBridge {
     }
     this.streamBuffer = '';
 
-    // 检查是否有选项
+    // 检查是否有选项 → 两端显示，等待用户回答
     if (this.looksLikeQuestion(text)) {
       this.pendingOptions = [];
       if (this.optionTimer) clearTimeout(this.optionTimer);
@@ -508,17 +519,41 @@ export class FeishuBridge {
   }
 
   private isYesNoQuestion(text: string): boolean {
-    const patterns = [
-      /\[y\/n\]/i, /\[Y\/n\]/, /\(yes\/no\)/i, /\(y\/n\)/i,
-      /proceed\??/i, /continue\??/i, /confirm\??/i,
-      /Allow this/i, /Do you want to/i,
-      /是否/i, /确认/i, /是否继续/i,
+    // 参考 claude-monitor：prompt + options 同时存在才判定
+    const PERM_PATTERNS = [
+      /requires approval/i,
+      /do you want/i,
+      /proceed/i,
+      /\?\s*\[y\/n\]/i,
+      /\?\s*\[Y\/n\]/,
+      /\(yes\/no\)/i,
+      /\(y\/n\)/i,
     ];
-    return patterns.some(p => p.test(text));
+    const hasPrompt = PERM_PATTERNS.some(p => p.test(text));
+    if (!hasPrompt) return false;
+
+    const hasYes = /\byes\b/i.test(text);
+    const hasNo = /\bno\b/i.test(text);
+    const hasAlways = /\balways\b/i.test(text) || /don'?t ask/i.test(text);
+    return (hasYes && hasNo) || hasAlways;
   }
 
   private looksLikeQuestion(text: string): boolean {
     return /[？?]/.test(text) || /选择|选一个|选项|pick|choose|select/i.test(text);
+  }
+
+  /**
+   * 检测文本中是否包含编号选项（1. xxx  2. xxx 等）
+   */
+  private containsNumberedOptions(text: string): boolean {
+    const lines = text.split('\n');
+    let optionCount = 0;
+    for (const line of lines) {
+      if (/^\s*\d{1,2}[.)]\s+/.test(line) || /^\s*[(（]\d{1,2}[)）]\s+/.test(line)) {
+        optionCount++;
+      }
+    }
+    return optionCount >= 2; // 至少 2 个编号选项才认为是选项列表
   }
 
   /**
