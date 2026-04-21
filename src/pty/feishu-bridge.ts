@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import * as path from 'path';
 import * as readline from 'readline';
 import * as lark from '@larksuiteoapi/node-sdk';
 import { PTYManager } from './pty-manager.js';
@@ -200,6 +201,9 @@ export class FeishuBridge {
 
     this.activeChatId = event.chatId;
     logger.info(this.tag, `活跃会话: ${event.chatId}（将同步 Claude 回复到此会话）`);
+
+    // 首次收到消息时自动保存 chatId 到 .env
+    this.saveChatId(event.chatId);
 
     // 透传模式：飞书消息直接写入 PTY（不 reset parser）
     // 非透传模式：用 send() 触发 parser markNewRound
@@ -449,6 +453,40 @@ export class FeishuBridge {
 
   private looksLikeQuestion(text: string): boolean {
     return /[？?]/.test(text) || /选择|选一个|选项|pick|choose|select/i.test(text);
+  }
+
+  /**
+   * 保存 chatId 到项目 .env 文件（首次收到消息时自动调用）
+   */
+  private saveChatId(chatId: string): void {
+    const envPath = path.join(process.cwd(), '.env');
+    const existing = this.config.chatIds || [];
+
+    // 已存在则跳过
+    if (existing.includes(chatId)) return;
+
+    // 添加到 chatIds 列表
+    const newChatIds = [...existing, chatId];
+    this.config.chatIds = newChatIds;
+
+    // 读取现有 .env 内容
+    let envContent = '';
+    if (fs.existsSync(envPath)) {
+      envContent = fs.readFileSync(envPath, 'utf-8');
+    }
+
+    // 更新或添加 FEISHU_CHAT_IDS
+    const chatIdsValue = newChatIds.join(',');
+    const chatIdsLine = `FEISHU_CHAT_IDS=${chatIdsValue}`;
+
+    if (/^FEISHU_CHAT_IDS=/m.test(envContent)) {
+      envContent = envContent.replace(/^FEISHU_CHAT_IDS=.*$/m, chatIdsLine);
+    } else {
+      envContent = envContent.trimEnd() + '\n' + chatIdsLine + '\n';
+    }
+
+    fs.writeFileSync(envPath, envContent);
+    logger.info(this.tag, `已保存 chatId 到 .env: ${chatIdsValue}`);
   }
 
   private parseMessageContent(messageType: string, content: string): string {
