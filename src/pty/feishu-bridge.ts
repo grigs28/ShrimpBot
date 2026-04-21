@@ -300,9 +300,12 @@ export class FeishuBridge {
       return;
     }
 
-    // 发送剩余增量
+    // 先发已积累的流式增量
     this.sendIncremental(targetChatId);
     this.streamBuffer = '';
+
+    // 发送完整回复文本（直接发，不依赖 streamBuffer）
+    this.sendRawText(targetChatId, text);
 
     // 检查选项
     if (this.looksLikeQuestion(text)) {
