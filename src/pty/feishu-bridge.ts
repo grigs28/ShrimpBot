@@ -21,12 +21,18 @@ export interface BridgeConfig {
   clone?: boolean;
 }
 
+/** 已知会话信息 */
+interface ChatInfo {
+  chatId: string;
+  chatType: 'p2p' | 'group';
+  /** 自动发现的时间 */
+  discoveredAt: number;
+}
+
 export class FeishuBridge {
   private feishuService: lark.Client;
   private pty: PTYManager;
   private config: BridgeConfig;
-  private lastSentText = '';
-  private activeChatId = '';
   private sendTimer: ReturnType<typeof setTimeout> | null = null;
   private tag: string;
   private wsClient: lark.WSClient | null = null;
@@ -41,8 +47,29 @@ export class FeishuBridge {
   private passthrough = false;
   /** 流式累积缓冲区：存储最新的累积文本 */
   private streamBuffer = '';
-  /** clone 模式上次发送的文本（用于去重） */
-  private cloneLastSent = '';
+  /** clone 模式上次发送的文本（用于去重），按 chatId 分开 */
+  private cloneLastSentMap = new Map<string, string>();
+  /** 普通模式上次发送的文本（用于去重），按 chatId 分开 */
+  private lastSentTextMap = new Map<string, string>();
+
+  // 消息队列：Claude 正在回复时，新消息排队等待
+  private messageQueue: Array<{ event: FeishuEvent; text: string }> = [];
+  /** Claude 是否正在回复中 */
+  private claudeBusy = false;
+
+  /**
+   * 当前回复目标 chatId（Claude 正在回复的会话）
+   * 只有 dispatchToClaude 和 processQueue 才会更新此字段
+   */
+  private responseChatId = '';
+  /**
+   * 默认同步目标（终端发起的对话同步到这里）
+   * 配置的第一个 chatId 或最近一次飞书消息来源
+   */
+  private defaultChatId = '';
+
+  /** 已知会话注册表：chatId → ChatInfo */
+  private knownChats = new Map<string, ChatInfo>();
 
   // 危险操作模式（阻止自动通过）
   private static readonly DANGEROUS_PATTERNS = [
@@ -71,9 +98,10 @@ export class FeishuBridge {
       botName: config.botName,
     });
 
-    // 默认发送目标：用配置的第一个 chatId，确保终端发起的对话也能同步到飞书
+    // 默认同步目标：配置的第一个 chatId
     if (config.chatIds.length > 0) {
-      this.activeChatId = config.chatIds[0]!;
+      this.defaultChatId = config.chatIds[0]!;
+      this.responseChatId = this.defaultChatId;
     }
 
     this.pty.onEvent((event) => {
@@ -134,7 +162,6 @@ export class FeishuBridge {
 
   /**
    * 透传模式：stdin 是 TTY 时，PTY 输出直接显示到终端，终端输入直接转发到 PTY
-   * 用户看到的是完整的 Claude Code TUI，同时飞书也能同步交互
    */
   private setupStdin(): void {
     if (!process.stdin.isTTY) {
@@ -143,23 +170,21 @@ export class FeishuBridge {
     }
 
     this.passthrough = true;
-    logger.setStderrEnabled(false); // 透传模式下日志只写文件，不输出到 stderr
+    logger.setStderrEnabled(false);
 
-    // 覆写 console.warn/console.error 为空操作，防止第三方库输出干扰 Claude Code TUI
     console.warn = () => {};
     console.error = () => {};
 
-    // 1. PTY 输出 → 终端 stdout（直接透传原始数据，保留 TUI 渲染）
+    // 1. PTY 输出 → 终端 stdout
     this.pty.onRawData((data: string) => {
       process.stdout.write(data);
     });
 
-    // 2. 终端 stdin → PTY（raw 模式，拦截 Ctrl+C / Ctrl+D 退出）
+    // 2. 终端 stdin → PTY
     process.stdin.setRawMode(true);
     process.stdin.resume();
     process.stdin.on('data', (data: Buffer) => {
       const input = data.toString();
-      // Ctrl+C (0x03) 或 Ctrl+D (0x04) → 退出 bridge
       if (input === '\x03' || input === '\x04') {
         this.stop();
         process.exit(0);
@@ -177,9 +202,6 @@ export class FeishuBridge {
     logger.info(this.tag, '透传模式已启用：终端直接显示 Claude Code TUI');
   }
 
-  /**
-   * 发送初始命令（-c 参数），透传模式用 writeRaw，否则用 send
-   */
   sendInitialCommand(command: string): void {
     if (this.passthrough) {
       this.pty.writeRaw(command + '\r');
@@ -191,80 +213,138 @@ export class FeishuBridge {
   // ========== 飞书 → Claude ==========
 
   private handleFeishuMessage(event: FeishuEvent): void {
+    // 过滤不在白名单中的会话
     if (this.config.chatIds.length > 0 && !this.config.chatIds.includes(event.chatId)) {
       return;
     }
+    // 过滤不在白名单中的用户
     if (this.config.allowedUsers.length > 0 && !this.config.allowedUsers.includes(event.userId)) {
       logger.warn(this.tag, `忽略未授权用户: ${event.userId}`);
       return;
     }
 
-    this.activeChatId = event.chatId;
-    logger.info(this.tag, `活跃会话: ${event.chatId}（将同步 Claude 回复到此会话）`);
+    // 注册/更新已知会话
+    this.registerChat(event);
 
-    // 首次收到消息时自动保存 chatId 到 .env
+    // 自动保存新 chatId 到 .env
     this.saveChatId(event.chatId);
 
-    // 透传模式：飞书消息直接写入 PTY（不 reset parser）
-    // 非透传模式：用 send() 触发 parser markNewRound
-    const sendToPty = (text: string) => {
-      if (this.passthrough) {
-        this.pty.writeRaw(text + '\r');
-      } else {
-        this.pty.send(text);
-      }
-    };
+    const text = event.text.trim();
+    if (!text) return;
 
-    // 如果在等待选项回答
+    const chatLabel = event.chatType === 'p2p' ? '私聊' : '群聊';
+
+    // 如果在等待选项回答 → 直接发送，不受队列限制
     if (this.waitingForAnswer) {
       this.waitingForAnswer = false;
-      const answer = event.text.trim();
-      logger.info(this.tag, `飞书回答 → Claude: "${answer}"`);
-      sendToPty(answer);
+      logger.info(this.tag, `[${chatLabel}] 飞书回答 → Claude: "${text}" (${event.chatId})`);
+      this.sendToPty(text);
+      this.claudeBusy = true;
       return;
     }
 
-    logger.info(this.tag, `飞书 → Claude: "${event.text.slice(0, 100)}" (chat: ${event.chatId})`);
+    // Claude 正在回复 → 消息排队
+    if (this.claudeBusy) {
+      logger.info(this.tag, `[${chatLabel}] Claude 忙碌，排队: "${text.slice(0, 50)}" (队列: ${this.messageQueue.length + 1})`);
+      this.messageQueue.push({ event, text });
+      // 通知排队
+      this.sendText(event.chatId, `⏳ 排队中（前面还有 ${this.messageQueue.length} 条消息）`);
+      return;
+    }
+
+    // 直接发送
+    this.dispatchToClaude(event, text);
+  }
+
+  /**
+   * 注册已知会话信息
+   */
+  private registerChat(event: FeishuEvent): void {
+    if (!this.knownChats.has(event.chatId)) {
+      this.knownChats.set(event.chatId, {
+        chatId: event.chatId,
+        chatType: event.chatType,
+        discoveredAt: Date.now(),
+      });
+      const label = event.chatType === 'p2p' ? '私聊' : '群聊';
+      logger.info(this.tag, `发现新会话 [${label}]: ${event.chatId} (用户: ${event.userId})`);
+    }
+  }
+
+  /**
+   * 将消息发送给 Claude PTY，并设置回复目标
+   */
+  private dispatchToClaude(event: FeishuEvent, text: string): void {
+    // 设置回复目标为此消息来源
+    this.responseChatId = event.chatId;
+    // 更新默认同步目标
+    this.defaultChatId = event.chatId;
+
+    const chatLabel = event.chatType === 'p2p' ? '私聊' : '群聊';
+    logger.info(this.tag, `[${chatLabel}] 飞书 → Claude: "${text.slice(0, 100)}" (${event.chatId})`);
+
     this.pendingOptions = [];
-    this.lastSentText = '';
     if (this.optionTimer) clearTimeout(this.optionTimer);
-    sendToPty(event.text);
+    this.claudeBusy = true;
+    this.sendToPty(text);
+  }
+
+  private sendToPty(text: string): void {
+    if (this.passthrough) {
+      this.pty.writeRaw(text + '\r');
+    } else {
+      this.pty.send(text);
+    }
+  }
+
+  /**
+   * Claude 回复完成后，检查队列是否有待处理消息
+   */
+  private processQueue(): void {
+    this.claudeBusy = false;
+
+    if (this.messageQueue.length === 0) return;
+
+    const item = this.messageQueue.shift()!;
+    const chatLabel = item.event.chatType === 'p2p' ? '私聊' : '群聊';
+    logger.info(this.tag, `[${chatLabel}] 处理队列: "${item.text.slice(0, 50)}" (剩余: ${this.messageQueue.length})`);
+
+    this.dispatchToClaude(item.event, item.text);
   }
 
   // ========== Claude → 飞书 + 终端 ==========
 
   private handleClaudeResponse(text: string, isComplete: boolean, isYesNo?: boolean): void {
-    if (!this.activeChatId) return;
+    // 使用 responseChatId（当前回复目标），回退到 defaultChatId
+    const targetChatId = this.responseChatId || this.defaultChatId;
+    if (!targetChatId) return;
     if (!text.trim()) return;
 
     if (!isComplete) {
-      // 流式累积：更新缓冲区
       this.streamBuffer = text;
       if (this.sendTimer) clearTimeout(this.sendTimer);
 
       if (this.config.clone) {
-        // clone 模式：只缓存，不流式发送（避免多条重复消息）
-        // 最终 isComplete=true 时一次性发送完整文本
+        // clone 模式：只缓存
       } else {
-        // 非 clone 模式：2 秒防抖后发送当前文本
         this.sendTimer = setTimeout(() => {
-          if (text && text !== this.lastSentText) {
-            this.sendText(this.activeChatId, text);
+          const lastSent = this.lastSentTextMap.get(targetChatId) || '';
+          if (text && text !== lastSent) {
+            this.sendText(targetChatId, text);
           }
         }, 2000);
       }
       return;
     }
 
-    // 完整回复 → 清除流式定时器
     if (this.sendTimer) clearTimeout(this.sendTimer);
 
-    // yes/no → 自动通过（危险操作除外）
+    // yes/no → 自动通过
     if (this.config.autoApprove !== false && (isYesNo || this.isYesNoQuestion(text))) {
       const isDangerous = FeishuBridge.DANGEROUS_PATTERNS.some(p => p.test(text));
       if (isDangerous) {
         logger.warn(this.tag, `检测到危险操作，阻止自动通过: "${text.slice(0, 80)}"`);
-        this.sendText(this.activeChatId, `⚠️ 检测到潜在危险操作，需要手动确认：\n${text}`);
+        this.sendText(targetChatId, `⚠️ 检测到潜在危险操作，需要手动确认：\n${text}`);
         this.waitingForAnswer = true;
         if (!this.passthrough) {
           fs.writeSync(2, `\x1b[31m⚠️ 危险操作！请手动确认（飞书或终端输入 yes/no）：\n${text}\x1b[0m\n`);
@@ -278,58 +358,59 @@ export class FeishuBridge {
           this.pty.send('yes');
         }
       }, 500);
-      this.sendText(this.activeChatId, `[自动通过] ${text}\n→ 已自动回复 yes`);
+      this.sendText(targetChatId, `[自动通过] ${text}\n→ 已自动回复 yes`);
       return;
     }
 
     // 发送完整回复
     if (this.config.clone) {
-      this.sendCloneText(this.activeChatId, text);
+      this.sendCloneText(targetChatId, text);
     } else {
-      this.sendText(this.activeChatId, text);
+      this.sendText(targetChatId, text);
     }
     this.streamBuffer = '';
 
-    // 检查后面是否可能有选项，启动选项缓冲
+    // 检查是否有选项
     if (this.looksLikeQuestion(text)) {
       this.pendingOptions = [];
       if (this.optionTimer) clearTimeout(this.optionTimer);
       this.optionTimer = setTimeout(() => this.flushOptions(), 1500);
+    } else {
+      this.processQueue();
     }
   }
 
-  /**
-   * 处理选项事件（从 PTY 解析出的编号选项行）
-   */
   private handleQuestion(options: string[]): void {
-    if (!this.activeChatId) return;
+    const targetChatId = this.responseChatId || this.defaultChatId;
+    if (!targetChatId) return;
 
     this.pendingOptions.push(...options);
     logger.debug(this.tag, `收集选项: ${options.join(', ')} (总计: ${this.pendingOptions.length})`);
 
-    // 重置定时器，等待更多选项
     if (this.optionTimer) clearTimeout(this.optionTimer);
     this.optionTimer = setTimeout(() => this.flushOptions(), 800);
   }
 
-  /**
-   * 刷新缓冲的选项，发送纯文本到飞书 + 显示到终端
-   */
   private flushOptions(): void {
-    if (this.pendingOptions.length === 0) return;
+    this.optionTimer = null;
+
+    if (this.pendingOptions.length === 0) {
+      this.processQueue();
+      return;
+    }
+
+    const targetChatId = this.responseChatId || this.defaultChatId;
+    if (!targetChatId) return;
 
     const options = [...this.pendingOptions];
     this.pendingOptions = [];
-    this.optionTimer = null;
     this.waitingForAnswer = true;
 
     const optionText = options.map((opt, i) => `${i + 1}. ${opt}`).join('\n');
     const message = `📋 请回复编号选择：\n${optionText}`;
 
-    // 发到飞书
-    this.sendText(this.activeChatId, message);
+    this.sendText(targetChatId, message);
 
-    // 终端显示（仅非透传模式，透传模式下 Claude TUI 自己会显示）
     if (!this.passthrough) {
       const terminal = [
         '',
@@ -346,7 +427,8 @@ export class FeishuBridge {
   // ========== 工具方法 ==========
 
   private async sendText(chatId: string, text: string): Promise<void> {
-    if (text === this.lastSentText) return;
+    const lastSent = this.lastSentTextMap.get(chatId) || '';
+    if (text === lastSent) return;
     const maxLen = 4000;
     const truncated = text.length > maxLen ? text.slice(0, maxLen) + '...' : text;
 
@@ -359,26 +441,21 @@ export class FeishuBridge {
         },
         params: { receive_id_type: 'chat_id' },
       });
-      this.lastSentText = text;
-      logger.info(this.tag, `飞书 ← Claude: "${truncated.slice(0, 80)}"`);
+      this.lastSentTextMap.set(chatId, text);
+      logger.info(this.tag, `飞书 ← Claude (${chatId}): "${truncated.slice(0, 80)}"`);
     } catch (err) {
       logger.error(this.tag, `发送飞书失败: ${err}`);
     }
   }
 
-  /**
-   * clone 模式发送：用飞书 post + md 富文本发送完整内容
-   * 支持代码块、列表等 Markdown 格式
-   */
   private async sendCloneText(chatId: string, text: string): Promise<void> {
-    if (text === this.cloneLastSent) return;
-    this.cloneLastSent = text;
+    const lastSent = this.cloneLastSentMap.get(chatId) || '';
+    if (text === lastSent) return;
+    this.cloneLastSentMap.set(chatId, text);
 
-    // 飞书 post 类型限制 30KB
     const maxBytes = 30 * 1024;
     const encoder = new TextEncoder();
 
-    // 如果超过限制，分片发送
     if (encoder.encode(text).length > maxBytes) {
       const chunks = this.splitText(text, maxBytes);
       for (const chunk of chunks) {
@@ -388,10 +465,9 @@ export class FeishuBridge {
       await this.sendPostMd(chatId, text);
     }
 
-    logger.info(this.tag, `飞书 ← Claude (clone): "${text.slice(0, 80)}"`);
+    logger.info(this.tag, `飞书 ← Claude (clone, ${chatId}): "${text.slice(0, 80)}"`);
   }
 
-  /** 用飞书 post + md 发送 */
   private async sendPostMd(chatId: string, text: string): Promise<void> {
     try {
       await this.feishuService.im.v1.message.create({
@@ -408,12 +484,10 @@ export class FeishuBridge {
       });
     } catch (err) {
       logger.error(this.tag, `飞书 post 发送失败，降级为 text: ${err}`);
-      // 降级为纯文本
       await this.sendText(chatId, text);
     }
   }
 
-  /** 按字节大小分片文本 */
   private splitText(text: string, maxBytes: number): string[] {
     const encoder = new TextEncoder();
     const lines = text.split('\n');
@@ -435,18 +509,10 @@ export class FeishuBridge {
 
   private isYesNoQuestion(text: string): boolean {
     const patterns = [
-      /\[y\/n\]/i,
-      /\[Y\/n\]/,
-      /\(yes\/no\)/i,
-      /\(y\/n\)/i,
-      /proceed\??/i,
-      /continue\??/i,
-      /confirm\??/i,
-      /Allow this/i,
-      /Do you want to/i,
-      /是否/i,
-      /确认/i,
-      /是否继续/i,
+      /\[y\/n\]/i, /\[Y\/n\]/, /\(yes\/no\)/i, /\(y\/n\)/i,
+      /proceed\??/i, /continue\??/i, /confirm\??/i,
+      /Allow this/i, /Do you want to/i,
+      /是否/i, /确认/i, /是否继续/i,
     ];
     return patterns.some(p => p.test(text));
   }
@@ -456,26 +522,22 @@ export class FeishuBridge {
   }
 
   /**
-   * 保存 chatId 到项目 .env 文件（首次收到消息时自动调用）
+   * 保存 chatId 到项目 .env 文件（自动记录新发现的会话）
    */
   private saveChatId(chatId: string): void {
     const envPath = path.join(process.cwd(), '.env');
     const existing = this.config.chatIds || [];
 
-    // 已存在则跳过
     if (existing.includes(chatId)) return;
 
-    // 添加到 chatIds 列表
     const newChatIds = [...existing, chatId];
     this.config.chatIds = newChatIds;
 
-    // 读取现有 .env 内容
     let envContent = '';
     if (fs.existsSync(envPath)) {
       envContent = fs.readFileSync(envPath, 'utf-8');
     }
 
-    // 更新或添加 FEISHU_CHAT_IDS
     const chatIdsValue = newChatIds.join(',');
     const chatIdsLine = `FEISHU_CHAT_IDS=${chatIdsValue}`;
 
@@ -486,7 +548,10 @@ export class FeishuBridge {
     }
 
     fs.writeFileSync(envPath, envContent);
-    logger.info(this.tag, `已保存 chatId 到 .env: ${chatIdsValue}`);
+
+    const info = this.knownChats.get(chatId);
+    const label = info?.chatType === 'p2p' ? '私聊' : '群聊';
+    logger.info(this.tag, `已保存 [${label}] chatId 到 .env: ${chatId} (总计: ${newChatIds.length} 个会话)`);
   }
 
   private parseMessageContent(messageType: string, content: string): string {
@@ -501,36 +566,21 @@ export class FeishuBridge {
   }
 
   stop(): void {
-    // 清理所有定时器
-    if (this.sendTimer) {
-      clearTimeout(this.sendTimer);
-      this.sendTimer = null;
-    }
-    if (this.optionTimer) {
-      clearTimeout(this.optionTimer);
-      this.optionTimer = null;
-    }
+    if (this.sendTimer) { clearTimeout(this.sendTimer); this.sendTimer = null; }
+    if (this.optionTimer) { clearTimeout(this.optionTimer); this.optionTimer = null; }
     this.pendingOptions = [];
     this.waitingForAnswer = false;
+    this.messageQueue = [];
+    this.claudeBusy = false;
 
-    // 关闭 PTY
     this.pty.stop();
 
-    // 关闭 stdin
     if (this.passthrough) {
-      try {
-        process.stdin.setRawMode(false);
-        process.stdin.pause();
-      } catch (_) { /* ignore */ }
+      try { process.stdin.setRawMode(false); process.stdin.pause(); } catch (_) { /* ignore */ }
     }
-    if (this.stdinRl) {
-      this.stdinRl.close();
-      this.stdinRl = null;
-    }
+    if (this.stdinRl) { this.stdinRl.close(); this.stdinRl = null; }
 
-    // 关闭 WSClient（飞书 SDK 可能没有 stop 方法，置空即可）
     this.wsClient = null;
-
     logger.info(this.tag, 'Bridge 已停止');
   }
 }
