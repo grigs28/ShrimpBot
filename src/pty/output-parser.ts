@@ -1,7 +1,7 @@
 import stripAnsi from 'strip-ansi';
 
 // Claude Code TUI 输出解析器
-// 过滤 TUI 渲染碎片，保留所有有意义的内容（包括状态动画词）
+// 只保留 Claude 的实际回复文本，过滤所有 TUI 渲染碎片
 
 // Loading 动画字符
 const LOADING_CHARS = new Set(['✶', '✻', '✽', '✢', '·', '*', '●']);
@@ -28,20 +28,40 @@ const TUI_FRAME = /^[╭╰│]/;
 const PROGRESS_BAR = /[█░▓▒]{2,}/;
 
 // TUI 控制提示碎片
-const TUI_CONTROL = /shift\+tab|bypass permissions/i;
+const TUI_CONTROL = /shift\+tab|bypass permissions|ctrl\+o to expand/i;
 
 // stop hook
 const STOP_HOOK = /running stop hook/;
 
-// TUI 碎片过滤规则（短且无意义的文本）
-// - 纯 ASCII ≤ 3 字符
-// - 纯百分比数字
-// - 进度条百分比行
+// Claude 状态动画词（Burrowing, Noodling, Moonwalking 等 TUI 瞬态显示）
+const CLAUDE_STATUS_WORDS = /^(Burrowing|Noodling|Sprouting|Moonwalking|Meditating|Pondering|Cogitating|Reasoning|Analyzing|Processing|Searching|Reading|Writing|Thinking|Waiting|Loading|Running|Executing|Working|Downloading|Uploading)/i;
+
+// 进度指标（token 计数、时间进度）
+const PROGRESS_INDICATOR = /\d+\s*tokens?|\d+s\s*·|[↓↑]\s*\d/i;
+
+// 工具执行标记（⎿ 前缀）
+const TOOL_LINE = /^⎿\s/;
+
+// 提示信息
+const TIP_LINE = /^Tip:\s/i;
+
+// thinking/thought 片段
+const THINKING_FRAGMENT = /\(thinking\)|thought for \d+s?\)/i;
+
+// TUI 重绘碎片（文字+箭头、部分状态词+数字、短字母数字混合）
+const REDRAW_JUNK = /[↓↑]\d*$|[↓↑]$|\w{1,5}\d{2,}$/;
+
+// 搜索/文件操作碎片
+const SEARCH_FRAGMENT = /listing \d+ director/i;
+
+// TUI 碎片过滤规则
 const JUNK_PATTERNS = [
-  /^[a-z0-9]{1,3}$/,        // 短 ASCII 碎片：n, tg, S3, p
+  /^[a-z0-9]{1,5}$/,        // 短 ASCII 碎片：n, tg, S3, p, wg62
   /^\d+%$/,                   // 纯百分比：18%
   /^██\s*\d*%?$/,            // 进度条：██18%
   /^\d+$/,                    // 纯数字：5, 8, 40
+  /^\d+[a-z]+$/i,            // 数字+字母碎片：2ies, 3inking
+  /^[a-z]+\d+$/i,            // 字母+数字碎片：wg62, uo34, r600
 ];
 
 // Yes/No 权限确认（参考 claude-monitor）
@@ -124,23 +144,48 @@ export class OutputParser {
       return { type: 'loading', text: '', isComplete: false };
     }
 
-    // TUI 框架 → 忽略
+    // ===== TUI 过滤（所有 TUI 渲染碎片） =====
+
+    // 框架边框
     if (SEPARATOR.test(line)) return null;
     if (STATUS_BAR.test(line)) return null;
     if (MCP_STATUS.test(line)) return null;
     if (TUI_FRAME.test(line)) return null;
 
-    // 进度条 → 忽略（██、░░）
+    // 进度条
     if (PROGRESS_BAR.test(line)) return null;
 
-    // TUI 控制提示 → 忽略
+    // TUI 控制提示
     if (TUI_CONTROL.test(line)) return null;
 
-    // stop hook → 忽略
+    // stop hook
     if (STOP_HOOK.test(line)) return null;
 
-    // TUI 碎片 → 忽略
+    // Claude 状态动画词（Burrowing, Noodling 等）
+    if (CLAUDE_STATUS_WORDS.test(line)) return null;
+
+    // 进度指标（token 计数、时间）
+    if (PROGRESS_INDICATOR.test(line)) return null;
+
+    // 工具执行标记（⎿ 前缀）
+    if (TOOL_LINE.test(line)) return null;
+
+    // 提示信息
+    if (TIP_LINE.test(line)) return null;
+
+    // thinking/thought 片段
+    if (THINKING_FRAGMENT.test(line)) return null;
+
+    // TUI 重绘碎片
+    if (REDRAW_JUNK.test(line)) return null;
+
+    // 搜索/文件操作碎片
+    if (SEARCH_FRAGMENT.test(line)) return null;
+
+    // TUI 短碎片
     if (JUNK_PATTERNS.some(p => p.test(line))) return null;
+
+    // ===== 有意义内容检测 =====
 
     // 去掉开头 loading 字符
     let text = line;
@@ -149,6 +194,11 @@ export class OutputParser {
     }
     text = text.trim();
     if (!text) return null;
+
+    // 最低文本门槛：纯 ASCII ≥8 字符 或 含中文
+    const hasChinese = /[\u4e00-\u9fff]/.test(text);
+    const isSubstantial = text.length >= 8 || hasChinese;
+    if (!isSubstantial) return null;
 
     // 选项行检测
     const optMatch = text.match(OPTION_PATTERN)
@@ -182,12 +232,7 @@ export class OutputParser {
       return { type: 'response', text: cleanText, isComplete: true, isYesNo };
     }
 
-    // 流式文本累积：只累积有意义的文本（≥4 字符 或 含中文）
-    const hasChinese = /[\u4e00-\u9fff]/.test(text);
-    const isSubstantial = text.length >= 4 || hasChinese;
-    if (!isSubstantial) return null;
-
-    // 行列表累积：同行更新 vs 新行
+    // 流式文本累积
     const lastLine = this.responseLines.length > 0
       ? this.responseLines[this.responseLines.length - 1]! : '';
     if (lastLine && (text.startsWith(lastLine) || lastLine.startsWith(text))) {
@@ -220,6 +265,8 @@ export class OutputParser {
     return text
       .replace(/\s*·\s*Noodling[^"]*$/, '')
       .replace(/\s*·\s*\w+\.\.\..*$/, '')
+      .replace(/\s*\d+s\s*·\s*[↓↑]\s*\d+.*$/, '') // "30s · ↓ 379 tokens" 尾部
+      .replace(/\s*ctrl\+o to expand.*$/i, '')
       .trim();
   }
 
