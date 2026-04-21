@@ -162,18 +162,26 @@ export async function setupWizard(): Promise<BridgeConfig> {
     // 1. 选择机器人
     const bot = await selectBot(rl);
 
-    // 2. 获取会话列表并选择
-    const client = new lark.Client({
-      appId: bot.appId,
-      appSecret: bot.appSecret,
-      disableTokenCache: false,
-    });
+    // 2. 已有 chat ID → 直接用，跳过会话选择
+    const existingChatIds = (process.env.FEISHU_CHAT_IDS || '').split(',').filter(Boolean);
+    let chatIds: string[];
 
-    const chatIds = await selectChats(rl, client);
+    if (existingChatIds.length > 0) {
+      chatIds = existingChatIds;
+      console.log(`\n✅ 使用已配置的会话: ${chatIds.join(', ')}`);
+    } else {
+      // 没有才获取会话列表
+      const client = new lark.Client({
+        appId: bot.appId,
+        appSecret: bot.appSecret,
+        disableTokenCache: false,
+      });
+      chatIds = await selectChats(rl, client);
 
-    if (chatIds.length === 0) {
-      console.error('❌ 未选择任何会话');
-      process.exit(1);
+      if (chatIds.length === 0) {
+        console.error('❌ 未选择任何会话');
+        process.exit(1);
+      }
     }
 
     // 3. 保存到 .env
