@@ -199,6 +199,7 @@ export class FeishuBridge {
     }
 
     this.activeChatId = event.chatId;
+    logger.info(this.tag, `活跃会话: ${event.chatId}（将同步 Claude 回复到此会话）`);
 
     // 透传模式：飞书消息直接写入 PTY（不 reset parser）
     // 非透传模式：用 send() 触发 parser markNewRound
@@ -238,14 +239,10 @@ export class FeishuBridge {
       if (this.sendTimer) clearTimeout(this.sendTimer);
 
       if (this.config.clone) {
-        // clone 模式：定期发送累积的全部文本
-        this.sendTimer = setTimeout(() => {
-          if (this.streamBuffer && this.streamBuffer !== this.cloneLastSent) {
-            this.sendCloneText(this.activeChatId, this.streamBuffer);
-          }
-        }, 2000);
+        // clone 模式：只缓存，不流式发送（避免多条重复消息）
+        // 最终 isComplete=true 时一次性发送完整文本
       } else {
-        // 非 clone 模式：发送当前文本
+        // 非 clone 模式：2 秒防抖后发送当前文本
         this.sendTimer = setTimeout(() => {
           if (text && text !== this.lastSentText) {
             this.sendText(this.activeChatId, text);

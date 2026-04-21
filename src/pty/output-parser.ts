@@ -77,6 +77,8 @@ export class OutputParser {
   private isWaitingInput = false;
   /** 是否需要在新内容到来时 reset 累积 */
   private pendingReset = false;
+  /** 当前响应的行列表（用于正确累积多行） */
+  private responseLines: string[] = [];
 
   /**
    * 处理一个 PTY 输出 chunk
@@ -85,6 +87,7 @@ export class OutputParser {
     // 处理延迟 reset：新消息发送后，第一个 chunk 到来时清理旧状态
     if (this.pendingReset) {
       this.accumulatedText = '';
+      this.responseLines = [];
       this.recentLines = [];
       this.isWaitingInput = false;
       this.pendingReset = false;
@@ -223,11 +226,16 @@ export class OutputParser {
       const isLongEnglish = text.length > 10 && /^[a-zA-Z]/.test(text) && /\s/.test(text);
 
       if (hasChinese || isLongEnglish) {
-        // 追加模式：多行回复（代码块、列表）需要累积
-        if (this.accumulatedText && !this.accumulatedText.endsWith('\n')) {
-          this.accumulatedText += '\n';
+        // 行列表累积：检测是新行还是当前行的更新
+        const lastLine = this.responseLines.length > 0 ? this.responseLines[this.responseLines.length - 1] : '';
+        if (lastLine && (text.startsWith(lastLine) || lastLine.startsWith(text))) {
+          // 同一行更新（TUI 重绘）：替换最后一行
+          this.responseLines[this.responseLines.length - 1] = text.length > lastLine.length ? text : lastLine;
+        } else {
+          // 新行：追加
+          this.responseLines.push(text);
         }
-        this.accumulatedText += text;
+        this.accumulatedText = this.responseLines.join('\n');
 
         // 如果包含 ● 标记，说明回复完成了
         const doneIdx = text.indexOf(DONE_MARKER);
@@ -238,6 +246,7 @@ export class OutputParser {
           if (cleanFull) {
             this.lastCompleteText = cleanFull;
             this.accumulatedText = '';
+            this.responseLines = [];
             this.isWaitingInput = true;
             return { type: 'response', text: cleanFull, isComplete: true };
           }
@@ -284,6 +293,7 @@ export class OutputParser {
 
   reset(): void {
     this.accumulatedText = '';
+    this.responseLines = [];
     this.lastCompleteText = '';
     this.recentLines = [];
     this.isWaitingInput = false;
