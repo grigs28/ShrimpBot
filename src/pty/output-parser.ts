@@ -1,9 +1,9 @@
 import stripAnsi from 'strip-ansi';
 
 // Claude Code TUI 输出解析器
-// 所有内容（包括状态文字）都通过，只过滤 TUI 框架元素
+// 过滤 TUI 渲染碎片，保留所有有意义的内容（包括状态动画词）
 
-// Loading 动画字符（单个旋转字符，不作为独立内容）
+// Loading 动画字符
 const LOADING_CHARS = new Set(['✶', '✻', '✽', '✢', '·', '*', '●']);
 
 // 用户输入回显
@@ -12,7 +12,7 @@ const INPUT_ECHO = /^❯\s/;
 // 分隔线
 const SEPARATOR = /^─+$/;
 
-// 状态栏（底部状态栏，如 [model] xxx │ tokens）
+// 状态栏（底部）
 const STATUS_BAR = /^\[.*\].*│/;
 
 // MCP 状态
@@ -24,24 +24,30 @@ const DONE_MARKER = '●';
 // TUI 框架边框
 const TUI_FRAME = /^[╭╰│]/;
 
-// Context 进度条
-const CONTEXT_BAR = /Context.*░/;
+// 进度条（██18%、░░ 等）
+const PROGRESS_BAR = /[█░▓▒]{2,}/;
 
-// stop hook 输出
+// TUI 控制提示碎片
+const TUI_CONTROL = /shift\+tab|bypass permissions/i;
+
+// stop hook
 const STOP_HOOK = /running stop hook/;
 
-// 纯 TUI 控制字符/短碎片（不超过 3 个 ASCII 字符的碎片）
-const SHORT_ASCII_JUNK = /^[a-z0-9]{1,3}$/;
+// TUI 碎片过滤规则（短且无意义的文本）
+// - 纯 ASCII ≤ 3 字符
+// - 纯百分比数字
+// - 进度条百分比行
+const JUNK_PATTERNS = [
+  /^[a-z0-9]{1,3}$/,        // 短 ASCII 碎片：n, tg, S3, p
+  /^\d+%$/,                   // 纯百分比：18%
+  /^██\s*\d*%?$/,            // 进度条：██18%
+  /^\d+$/,                    // 纯数字：5, 8, 40
+];
 
-// Yes/No 权限确认（参考 claude-monitor：prompt + options 同时存在）
+// Yes/No 权限确认（参考 claude-monitor）
 const PERM_PATTERNS = [
-  /requires approval/i,
-  /do you want/i,
-  /proceed/i,
-  /\?\s*\[y\/n\]/i,
-  /\?\s*\[Y\/n\]/,
-  /\(yes\/no\)/i,
-  /\(y\/n\)/i,
+  /requires approval/i, /do you want/i, /proceed/i,
+  /\?\s*\[y\/n\]/i, /\?\s*\[Y\/n\]/, /\(yes\/no\)/i, /\(y\/n\)/i,
 ];
 const PERM_OPTION_YES = /\byes\b/i;
 const PERM_OPTION_NO = /\bno\b/i;
@@ -81,20 +87,17 @@ export class OutputParser {
 
     const clean = stripAnsi(rawData);
     const results: ParsedOutput[] = [];
-
     const lines = clean.split(/\r\r?\n?/);
 
     for (const line of lines) {
       const trimmed = line.trim();
       if (!trimmed) continue;
 
-      // 输入提示符 → 本轮结束
       if (INPUT_ECHO.test(trimmed)) {
         this.isWaitingInput = true;
         continue;
       }
 
-      // 分隔线 → 新一轮开始，清空累积
       if (SEPARATOR.test(trimmed)) {
         this.isWaitingInput = false;
         this.accumulatedText = '';
@@ -107,9 +110,7 @@ export class OutputParser {
         results.push(parsed);
         if (parsed.type === 'response') {
           this.recentLines.push(parsed.text);
-          if (this.recentLines.length > 10) {
-            this.recentLines.shift();
-          }
+          if (this.recentLines.length > 10) this.recentLines.shift();
         }
       }
     }
@@ -123,18 +124,23 @@ export class OutputParser {
       return { type: 'loading', text: '', isComplete: false };
     }
 
-    // TUI 框架元素 → 忽略
+    // TUI 框架 → 忽略
     if (SEPARATOR.test(line)) return null;
     if (STATUS_BAR.test(line)) return null;
     if (MCP_STATUS.test(line)) return null;
     if (TUI_FRAME.test(line)) return null;
-    if (CONTEXT_BAR.test(line)) return null;
+
+    // 进度条 → 忽略（██、░░）
+    if (PROGRESS_BAR.test(line)) return null;
+
+    // TUI 控制提示 → 忽略
+    if (TUI_CONTROL.test(line)) return null;
 
     // stop hook → 忽略
     if (STOP_HOOK.test(line)) return null;
 
-    // 短 ASCII 碎片 → 忽略
-    if (SHORT_ASCII_JUNK.test(line)) return null;
+    // TUI 碎片 → 忽略
+    if (JUNK_PATTERNS.some(p => p.test(line))) return null;
 
     // 去掉开头 loading 字符
     let text = line;
@@ -149,28 +155,17 @@ export class OutputParser {
       || text.match(OPTION_ALT_PATTERNS[0])!
       || text.match(OPTION_ALT_PATTERNS[1]);
     if (optMatch && optMatch[2]) {
-      return {
-        type: 'question',
-        text: optMatch[2].trim(),
-        isComplete: true,
-        options: [optMatch[2].trim()],
-      };
+      return { type: 'question', text: optMatch[2].trim(), isComplete: true, options: [optMatch[2].trim()] };
     }
 
     // ● 完成标记
     if (text.startsWith(DONE_MARKER)) {
-      const cleanText = text.slice(1).trim();
+      const cleanText = this.cleanResponseText(text.slice(1).trim());
       if (!cleanText) return null;
 
-      // 检查 ● 后是否是选项
       const optM = cleanText.match(OPTION_PATTERN);
       if (optM) {
-        return {
-          type: 'question',
-          text: optM[2]!.trim(),
-          isComplete: true,
-          options: [optM[2]!.trim()],
-        };
+        return { type: 'question', text: optM[2]!.trim(), isComplete: true, options: [optM[2]!.trim()] };
       }
 
       this.lastCompleteText = cleanText;
@@ -187,18 +182,23 @@ export class OutputParser {
       return { type: 'response', text: cleanText, isComplete: true, isYesNo };
     }
 
-    // 流式文本：所有非框架内容都累积
+    // 流式文本累积：只累积有意义的文本（≥4 字符 或 含中文）
+    const hasChinese = /[\u4e00-\u9fff]/.test(text);
+    const isSubstantial = text.length >= 4 || hasChinese;
+    if (!isSubstantial) return null;
+
+    // 行列表累积：同行更新 vs 新行
     const lastLine = this.responseLines.length > 0
       ? this.responseLines[this.responseLines.length - 1]! : '';
     if (lastLine && (text.startsWith(lastLine) || lastLine.startsWith(text))) {
-      // 同一行更新（TUI 重绘）
+      // 同一行更新（TUI 重绘）：保留更长的版本
       this.responseLines[this.responseLines.length - 1] = text.length > lastLine.length ? text : lastLine;
     } else {
       this.responseLines.push(text);
     }
     this.accumulatedText = this.responseLines.join('\n');
 
-    // 如果包含 ● 标记 → 回复完成
+    // 包含 ● → 回复完成
     if (text.includes(DONE_MARKER)) {
       const fullText = this.accumulatedText.replace(/●/g, '').trim();
       if (fullText) {
@@ -213,25 +213,21 @@ export class OutputParser {
     return { type: 'response', text: this.accumulatedText, isComplete: false };
   }
 
-  markNewRound(): void {
-    this.pendingReset = true;
+  /**
+   * 清理回复文本尾部的 TUI 状态碎片
+   */
+  private cleanResponseText(text: string): string {
+    return text
+      .replace(/\s*·\s*Noodling[^"]*$/, '')
+      .replace(/\s*·\s*\w+\.\.\..*$/, '')
+      .trim();
   }
 
-  getIsWaitingInput(): boolean {
-    return this.isWaitingInput;
-  }
-
-  getLastComplete(): string {
-    return this.lastCompleteText;
-  }
-
-  getAccumulated(): string {
-    return this.accumulatedText;
-  }
-
-  getRecentLines(): string[] {
-    return [...this.recentLines];
-  }
+  markNewRound(): void { this.pendingReset = true; }
+  getIsWaitingInput(): boolean { return this.isWaitingInput; }
+  getLastComplete(): string { return this.lastCompleteText; }
+  getAccumulated(): string { return this.accumulatedText; }
+  getRecentLines(): string[] { return [...this.recentLines]; }
 
   reset(): void {
     this.accumulatedText = '';
