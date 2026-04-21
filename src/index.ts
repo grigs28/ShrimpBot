@@ -17,7 +17,7 @@ import type { Config } from './types/index.js';
 
 // sbot 自己的参数（只解析这些，其余全部透传给 Claude）
 const SBOT_FLAGS = new Set(['--debug', '--clone', '-h', '--help']);
-const SBOT_OPTIONS = new Set(['-c', '--command', '--cwd', '--chat', '--app-id', '--app-secret', '--name']);
+const SBOT_OPTIONS = new Set(['--command', '--cwd', '--chat', '--app-id', '--app-secret', '--name']);
 
 interface CliArgs {
   command?: string;
@@ -56,9 +56,14 @@ function parseArgs(): CliArgs {
 
     // sbot 带值参数
     if (SBOT_OPTIONS.has(arg)) {
-      const value = argv[++i];
+      const value = argv[i + 1];
+      // 下一个参数是 flag 或不存在 → 跳过（不把 flag 误吞为值）
+      if (!value || value.startsWith('-')) {
+        i++;
+        continue;
+      }
+      i++;
       switch (arg) {
-        case '-c':
         case '--command': args.command = value; break;
         case '--cwd': args.cwd = value; break;
         case '--chat': args.chatId = value; break;
@@ -98,7 +103,7 @@ sbot — 飞书 <-> Claude Code 实时通信桥
   init                     初始化配置（交互式或参数式）
 
 sbot 选项:
-  -c, --command <文本>     启动后自动发送的命令
+  --command <文本>          启动后自动发送的命令
   --cwd <目录>             Claude Code 工作目录
   --chat <chat_id>         指定飞书会话 ID
   --debug                  开启调试日志
@@ -123,7 +128,7 @@ Claude 选项（全部透传给 Claude Code CLI）:
   sbot init                            交互式初始化
   sbot init --app-id cli_xxx --app-secret yyy --name "小虾虾"
   sbot --clone                         飞书完全同步模式
-  sbot -c "列出文件"                    启动并自动执行命令
+  sbot --command "列出文件"               启动并自动执行命令
   sbot --cwd /tmp --model claude-opus  sbot 参数 + Claude 参数混用
 `);
 }
