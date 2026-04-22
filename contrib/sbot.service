@@ -1,0 +1,16 @@
+[Unit]
+Description=ShrimpBot — Web 终端模式
+Documentation=https://github.com/grigs28/ShrimpBot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=grigs
+WorkingDirectory=/opt/ShrimpBot
+ExecStart=/bin/bash -lc '. /home/grigs/.nvm/nvm.sh && node /opt/ShrimpBot/dist/index.js --web'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

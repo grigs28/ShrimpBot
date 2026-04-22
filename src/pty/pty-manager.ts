@@ -27,7 +27,7 @@ export class PTYManager {
   private rawListeners: ((data: string) => void)[] = [];
   private running = false;
   private tag: string;
-  private stopped = false; // 用户主动停止
+  private stopped = false;
   private restartCount = 0;
   private readonly MAX_RESTARTS = 5;
   private readonly RESTART_WINDOW_MS = 60000;
@@ -46,36 +46,42 @@ export class PTYManager {
     const claudePath = this.options.claudePath || 'claude';
     const args = ['--dangerously-skip-permissions', ...(this.options.extraArgs || [])];
 
+    const cols = this.options.cols || 120;
+    const rows = this.options.rows || 40;
+
     this.pty = spawn(claudePath, args, {
       name: 'xterm-256color',
-      cols: this.options.cols || 120,
-      rows: this.options.rows || 40,
+      cols,
+      rows,
       cwd: this.options.cwd || process.cwd(),
       env: process.env as Record<string, string>,
     });
 
     this.running = true;
-    logger.info(this.tag, `启动: claude ${args.join(' ')} (cwd: ${this.options.cwd || process.cwd()})`);
+    logger.info(this.tag, `启动: claude ${args.join(' ')} (cwd: ${this.options.cwd || process.cwd()}, ${cols}x${rows})`);
 
+    let dataCount = 0;
     this.pty.onData((data: string) => {
-      // 通知原始数据监听器（用于透传模式）
+      dataCount++;
+      if (dataCount <= 5 || dataCount % 100 === 0) {
+        logger.debug(this.tag, ` onData #${dataCount}: ${data.length}字节`);
+      }
+
+      // 1. 通知原始数据监听器（透传模式 + Web 广播）
       for (const cb of this.rawListeners) {
         try { cb(data); } catch (_) { /* ignore */ }
       }
 
-      // 记录 PTY 原始输出
-      logger.ptyRaw(data);
-
+      // 2. 解析提取有意义内容（飞书用）
       const results = this.parser.parse(data);
 
-      // 记录解析结果
       if (results.length > 0) {
-        logger.parseResult(results);
+        logger.debug(this.tag, `解析到 ${results.length} 条输出`);
       }
 
       for (const result of results) {
         if (result.type === 'response' && result.text) {
-          logger.debug(this.tag, `→ response: complete=${result.isComplete} yesNo=${result.isYesNo || false} "${result.text.slice(0, 80)}"`);
+          logger.debug(this.tag, `→ response: complete=${result.isComplete} "${result.text.slice(0, 80)}"`);
           this.emit({ type: 'response', text: result.text, isComplete: result.isComplete, isYesNo: result.isYesNo });
         } else if (result.type === 'question') {
           logger.debug(this.tag, `→ question: options=${JSON.stringify(result.options)}`);
@@ -90,7 +96,6 @@ export class PTYManager {
       this.emit({ type: 'exit', code: exitCode });
       this.pty = null;
 
-      // 自动重启（非用户主动停止时）
       if (this.options.autoRestart !== false && !this.stopped) {
         this.scheduleRestart();
       }
@@ -101,8 +106,6 @@ export class PTYManager {
     if (!this.pty || !this.running) {
       throw new Error('PTY not running');
     }
-    // 延迟 reset：标记新一轮，第一个 chunk 到来时清理旧状态
-    // 避免立即 reset 导致残留输出被误解析
     this.parser.markNewRound();
     this.pty.write(message + '\r');
     logger.info(this.tag, `← 发送: "${message.slice(0, 100)}"`);
@@ -120,23 +123,35 @@ export class PTYManager {
     this.listeners.push(listener);
   }
 
-  /** 监听 PTY 原始输出（用于透传到终端） */
+  /** 监听 PTY 原始输出（透传 + Web 广播） */
   onRawData(callback: (data: string) => void): void {
     this.rawListeners.push(callback);
   }
 
-  /** 直接写入 PTY（不做 parser reset，用于透传模式） */
+  /** 直接写入 PTY（透传模式） */
   writeRaw(data: string): void {
     if (this.pty && this.running) {
+      logger.info(this.tag, `← writeRaw: ${JSON.stringify(data)}`);
       this.pty.write(data);
     }
   }
 
-  /** 调整 PTY 终端大小 */
+  /** 调整 PTY + headless 终端大小 */
   resize(cols: number, rows: number): void {
     if (this.pty) {
       this.pty.resize(cols, rows);
     }
+    this.parser.resize(cols, rows);
+  }
+
+  /** 获取终端缓冲区文本（Web API 用） */
+  getBufferText(): string {
+    return this.parser.getBufferText();
+  }
+
+  /** 获取终端尺寸 */
+  getTerminalSize(): { cols: number; rows: number } {
+    return { cols: this.parser.getCols(), rows: this.parser.getRows() };
   }
 
   private emit(event: PTYEvent): void {
@@ -164,7 +179,7 @@ export class PTYManager {
     }
 
     this.restartHistory.push(now);
-    const delay = Math.min(3000 * (this.restartHistory.length), 15000); // 指数退避，最大15秒
+    const delay = Math.min(3000 * (this.restartHistory.length), 15000);
     logger.info(this.tag, `将在 ${delay / 1000} 秒后自动重启 (${this.restartHistory.length}/${this.MAX_RESTARTS})`);
 
     setTimeout(() => {

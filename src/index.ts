@@ -9,6 +9,8 @@ import { loadMultiBotConfig, loadSingleBotConfig } from './config.js';
 import { Master } from './master.js';
 import { startBot } from './bot.js';
 import { FeishuBridge } from './pty/feishu-bridge.js';
+import { PTYManager } from './pty/pty-manager.js';
+import { WebServer } from './pty/web-server.js';
 import { setupWizard } from './setup.js';
 import { logger } from './logger.js';
 import type { Config } from './types/index.js';
@@ -16,7 +18,7 @@ import type { Config } from './types/index.js';
 // ========== CLI 参数解析 ==========
 
 // sbot 自己的参数（只解析这些，其余全部透传给 Claude）
-const SBOT_FLAGS = new Set(['--debug', '--clone', '-h', '--help']);
+const SBOT_FLAGS = new Set(['--debug', '--clone', '--web', '-h', '--help']);
 const SBOT_OPTIONS = new Set(['--command', '--cwd', '--chat', '--app-id', '--app-secret', '--name']);
 
 interface CliArgs {
@@ -25,6 +27,7 @@ interface CliArgs {
   chatId?: string;
   debug?: boolean;
   clone?: boolean;
+  web?: boolean;
   appId?: string;
   appSecret?: string;
   name?: string;
@@ -80,6 +83,7 @@ function parseArgs(): CliArgs {
       switch (arg) {
         case '--debug': args.debug = true; break;
         case '--clone': args.clone = true; break;
+        case '--web': args.web = true; break;
       }
       i++;
       continue;
@@ -108,6 +112,8 @@ sbot 选项:
   --chat <chat_id>         指定飞书会话 ID
   --debug                  开启调试日志
   --clone                  飞书与终端完全同步（多行完整显示）
+  --web                    启用 Web 终端（飞书+终端+Web 三端模式）
+                            仅 --web 不带飞书配置时为纯 Web 模式
   -h, --help               显示帮助
 
 init 选项:
@@ -128,6 +134,8 @@ Claude 选项（全部透传给 Claude Code CLI）:
   sbot init                            交互式初始化
   sbot init --app-id cli_xxx --app-secret yyy --name "小虾虾"
   sbot --clone                         飞书完全同步模式
+  sbot --web                           飞书+终端+Web 三端模式
+  sbot --web (无飞书配置时)              纯 Web 终端模式（端口 5554）
   sbot --command "列出文件"               启动并自动执行命令
   sbot --cwd /tmp --model claude-opus  sbot 参数 + Claude 参数混用
 `);
@@ -185,14 +193,96 @@ function getConfig(): Config {
   };
 }
 
+async function startWebOnlyMode(): Promise<void> {
+  const webPort = parseInt(process.env.WEB_PORT || '5554', 10);
+
+  // 检查端口
+  const available = await WebServer.isPortAvailable(webPort);
+  if (!available) {
+    logger.error('Main', `端口 ${webPort} 已被占用，无法启动 Web 终端`);
+    process.exit(1);
+  }
+
+  const extraArgs = [
+    ...(process.env.CLAUDE_EXTRA_ARGS?.split(' ').filter(Boolean) || []),
+    ...claudeExtraArgs,
+  ];
+
+  const pty = new PTYManager({
+    claudePath: process.env.CLAUDE_PATH,
+    cwd: process.env.CLAUDE_CWD,
+    extraArgs: extraArgs.length > 0 ? extraArgs : undefined,
+    botName: process.env.FEISHU_BOT_NAME || 'ShrimpBot',
+  });
+
+  const webServer = new WebServer({
+    onPtyData: (cb) => { pty.onRawData(cb); },
+    ptyWrite: (data) => { pty.writeRaw(data); },
+    getBufferText: () => pty.getBufferText(),
+    getTerminalSize: () => pty.getTerminalSize(),
+    botName: process.env.FEISHU_BOT_NAME || 'ShrimpBot',
+  }, webPort);
+
+  pty.start();
+  await webServer.start();
+
+  logger.info('Main', `Web-Only 模式启动完成: http://localhost:${webPort}`);
+
+  // -c 初始命令
+  if (cliArgs.command) {
+    setTimeout(() => {
+      logger.info('Main', `执行初始命令: "${cliArgs.command}"`);
+      pty.send(cliArgs.command!);
+    }, 3000);
+  }
+
+  // 终端透传
+  if (process.stdin.isTTY) {
+    logger.setStderrEnabled(false);
+    console.warn = () => {};
+    console.error = () => {};
+    pty.onRawData((data: string) => { process.stdout.write(data); });
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.on('data', (data: Buffer) => {
+      const input = data.toString();
+      if (input === '\x03' || input === '\x04') {
+        pty.stop();
+        process.exit(0);
+      }
+      pty.writeRaw(input);
+    });
+    const resize = () => {
+      pty.resize(process.stdout.columns || 120, process.stdout.rows || 40);
+    };
+    resize();
+    process.stdout.on('resize', resize);
+  }
+
+  const cleanup = () => {
+    webServer.stop();
+    pty.stop();
+    process.exit(0);
+  };
+  process.on('SIGINT', cleanup);
+  process.on('SIGTERM', cleanup);
+}
+
 async function startBridgeMode(): Promise<void> {
   let appId = process.env.FEISHU_APP_ID;
   let appSecret = process.env.FEISHU_APP_SECRET;
   let chatIds = (process.env.FEISHU_CHAT_IDS || '').split(',').filter(Boolean);
   const allowedUsers = (process.env.FEISHU_ALLOWED_USERS || '').split(',').filter(Boolean);
 
-  // 没有凭证 → 首次启动向导（空 chatIds 表示接受所有会话，不触发向导）
+  // 没有飞书凭证
   if (!appId || !appSecret) {
+    // --web 时跳过向导，走纯 Web 模式
+    if (cliArgs.web) {
+      logger.info('Main', '无飞书配置，--web 模式启动纯 Web 终端');
+      await startWebOnlyMode();
+      return;
+    }
+    // 否则启动向导
     logger.info('Main', '未检测到配置，启动向导...');
     const config = await setupWizard();
     appId = config.feishuAppId;
@@ -216,6 +306,8 @@ async function startBridgeMode(): Promise<void> {
     claudeCwd: process.env.CLAUDE_CWD,
     claudeExtraArgs: extraArgs.length > 0 ? extraArgs : undefined,
     clone: cliArgs.clone,
+    webEnabled: cliArgs.web,
+    webPort: parseInt(process.env.WEB_PORT || '5554', 10),
   });
 
   await bridge.start();
