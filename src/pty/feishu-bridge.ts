@@ -505,8 +505,11 @@ export class FeishuBridge {
     }
   }
 
-  /** Patch 当前卡片（完成/错误/选项） */
-  private async patchCard(color: string, title: string, content: string): Promise<void> {
+  /** Patch 当前卡片（完成/进度/选项）
+   *  只有最终完成（🟢）或选项（🟡）才清掉 currentCardId
+   *  进度更新（🔄）保持 currentCardId，允许后续继续更新
+   */
+  private async patchCard(color: string, title: string, content: string, keepAlive = false): Promise<void> {
     const chatId = this.currentCardChatId || this.responseChatId || this.defaultChatId;
     if (!chatId) return;
 
@@ -523,8 +526,10 @@ export class FeishuBridge {
           data: { content: JSON.stringify(this.buildCard(color, title, truncated)) },
         });
         logger.info(this.tag, `卡片已更新: ${title}`);
-        this.currentCardId = null;
-        this.currentCardChatId = null;
+        if (!keepAlive) {
+          this.currentCardId = null;
+          this.currentCardChatId = null;
+        }
         return;
       } catch (err) {
         logger.warn(this.tag, `Patch 卡片失败，降级发新消息: ${err}`);
@@ -817,7 +822,7 @@ export class FeishuBridge {
             const content = this.readLastAssistantFromTranscript(this.lastTranscriptPath);
             logger.info(this.tag, `Hook Stop (debounced): transcript=${content.length}字, 预览="${content.slice(0, 100)}"`);
             if (content.trim()) {
-              this.patchCard('blue', '🔄 处理中', content);
+              this.patchCard('blue', '🔄 处理中', content, true);
             }
           }, 3000);
           return;
@@ -828,22 +833,16 @@ export class FeishuBridge {
       case 'Notification': {
         const msg = event.message || event.title || '';
         if (msg) {
-          if (this.config.clone) {
-            this.enqueueSend(targetChatId, `📢 ${msg}`, true, '通知');
-          } else {
-            this.patchCard('yellow', '📢 通知', msg);
-          }
+          // 发独立消息，不 patch 主卡片（避免清掉 currentCardId 影响 Stop 流程）
+          this.enqueueSend(targetChatId, `📢 ${msg}`, true, '通知');
         }
         break;
       }
       case 'PostToolUseFailure': {
         const toolName = event.tool_name || 'unknown';
         const error = event.error || '未知错误';
-        if (this.config.clone) {
-          this.enqueueSend(targetChatId, `❌ 工具失败 **${toolName}**: ${error}`, true, '工具失败');
-        } else {
-          this.patchCard('red', '🔴 工具失败', `**${toolName}**: ${error}`);
-        }
+        // 发独立消息，不 patch 主卡片
+        this.enqueueSend(targetChatId, `❌ 工具失败 **${toolName}**: ${error}`, true, '工具失败');
         break;
       }
     }
