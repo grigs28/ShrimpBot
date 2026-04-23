@@ -19,7 +19,7 @@ import type { Config } from './types/index.js';
 // ========== CLI 参数解析 ==========
 
 // sbot 自己的参数（只解析这些，其余全部透传给 Claude）
-const SBOT_FLAGS = new Set(['--debug', '--clone', '--web', '-h', '--help']);
+const SBOT_FLAGS = new Set(['--debug', '--clone', '--web', '--web-server', '-h', '--help']);
 const SBOT_OPTIONS = new Set(['--command', '--cwd', '--chat', '--app-id', '--app-secret', '--name']);
 
 interface CliArgs {
@@ -29,6 +29,7 @@ interface CliArgs {
   debug?: boolean;
   clone?: boolean;
   web?: boolean;
+  webServer?: boolean;
   appId?: string;
   appSecret?: string;
   name?: string;
@@ -85,6 +86,7 @@ function parseArgs(): CliArgs {
         case '--debug': args.debug = true; break;
         case '--clone': args.clone = true; break;
         case '--web': args.web = true; break;
+        case '--web-server': args.webServer = true; break;
       }
       i++;
       continue;
@@ -115,6 +117,7 @@ sbot 选项:
   --clone                  飞书与终端完全同步（多行完整显示）
   --web                    启用 Web 终端（飞书+终端+Web 三端模式）
                             仅 --web 不带飞书配置时为纯 Web 模式
+  --web-server             独立 Web 服务（不启动 PTY/飞书，仅 Web UI + API）
   -h, --help               显示帮助
 
 init 选项:
@@ -272,6 +275,33 @@ async function startWebOnlyMode(): Promise<void> {
   process.on('SIGTERM', cleanup);
 }
 
+/** 独立 Web 服务（不启动 PTY/飞书，仅 Web UI + Hook API） */
+async function startStandaloneWebServer(): Promise<void> {
+  const webPort = parseInt(process.env.WEB_PORT || '5554', 10);
+
+  const available = await WebServer.isPortAvailable(webPort);
+  if (!available) {
+    logger.error('Main', `端口 ${webPort} 已被占用`);
+    process.exit(1);
+  }
+
+  const webServer = new WebServer({
+    botName: 'ShrimpBot Hub',
+  }, webPort);
+
+  await webServer.start();
+  logger.info('Main', `独立 Web 服务已启动: http://localhost:${webPort}`);
+
+  process.on('SIGINT', () => {
+    webServer.stop();
+    process.exit(0);
+  });
+  process.on('SIGTERM', () => {
+    webServer.stop();
+    process.exit(0);
+  });
+}
+
 async function startBridgeMode(): Promise<void> {
   // CLI 参数覆盖
   let appId = cliArgs.appId || process.env.FEISHU_APP_ID;
@@ -409,6 +439,12 @@ async function main() {
   // sbot init 子命令：初始化配置后直接启动
   if (cliArgs.isInit) {
     await handleInit();
+    return;
+  }
+
+  // --web-server：独立 Web 服务（不启动 PTY/飞书，仅 Web UI + Hook API）
+  if (cliArgs.webServer) {
+    await startStandaloneWebServer();
     return;
   }
 

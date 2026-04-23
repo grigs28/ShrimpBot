@@ -185,6 +185,23 @@ sbot --debug        # 或
 LOG_LEVEL=debug sbot
 ```
 
+## systemd 服务 / systemd Service
+
+```bash
+# 独立 Web 服务（只跑 Web UI + Hook API，不启动 PTY/飞书）
+sudo cp contrib/sbot-web.service /etc/systemd/system/
+sudo systemctl enable --now sbot-web
+
+# 完整飞书+Web+终端模式
+sudo cp contrib/sbot-feishu.service /etc/systemd/system/
+sudo systemctl enable --now sbot-feishu
+```
+
+| 服务 | 说明 |
+|------|------|
+| `sbot-web.service` | 独立 Web 服务（`--web-server`），只提供 Web UI 和 Hook API |
+| `sbot-feishu.service` | 完整模式（PTY + 飞书 + Web），适合无人值守运行 |
+
 ## 开发 / Development
 
 ```bash

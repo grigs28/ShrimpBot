@@ -7,14 +7,14 @@ import { logger } from '../logger.js';
 import type { HookEvent } from '../types/index.js';
 
 export interface WebServerDeps {
-  /** PTY 原始数据广播 */
-  onPtyData: (callback: (data: string) => void) => void;
-  /** 向 PTY 写入 */
-  ptyWrite: (data: string) => void;
-  /** 获取终端缓冲区文本 */
-  getBufferText: () => string;
-  /** 获取终端尺寸 */
-  getTerminalSize: () => { cols: number; rows: number };
+  /** PTY 原始数据广播（独立 Web 模式不需要） */
+  onPtyData?: (callback: (data: string) => void) => void;
+  /** 向 PTY 写入（独立 Web 模式不需要） */
+  ptyWrite?: (data: string) => void;
+  /** 获取终端缓冲区文本（独立 Web 模式不需要） */
+  getBufferText?: () => string;
+  /** 获取终端尺寸（独立 Web 模式不需要） */
+  getTerminalSize?: () => { cols: number; rows: number };
   /** Bot 名称 */
   botName?: string;
   /** Claude Code Hook 事件回调 */
@@ -51,8 +51,8 @@ export class WebServer {
     // API: 获取终端缓冲区文本
     this.app.get('/api/buffer', (_req, res) => {
       res.json({
-        text: this.deps.getBufferText(),
-        size: this.deps.getTerminalSize(),
+        text: this.deps.getBufferText?.() || '',
+        size: this.deps.getTerminalSize?.() || { cols: 120, rows: 40 },
         botName: this.deps.botName || 'ShrimpBot',
       });
     });
@@ -62,6 +62,10 @@ export class WebServer {
       const { text } = req.body || {};
       if (!text || typeof text !== 'string') {
         res.status(400).json({ error: 'text required' });
+        return;
+      }
+      if (!this.deps.ptyWrite) {
+        res.status(503).json({ error: 'No PTY connected' });
         return;
       }
       logger.info(this.tag, `API 发送: "${text.slice(0, 100)}"`);
@@ -74,7 +78,7 @@ export class WebServer {
       res.json({
         botName: this.deps.botName || 'ShrimpBot',
         clients: this.clients.size,
-        terminal: this.deps.getTerminalSize(),
+        terminal: this.deps.getTerminalSize?.() || { cols: 120, rows: 40 },
       });
     });
 
@@ -90,25 +94,29 @@ export class WebServer {
   }
 
   private setupWebSocket(): void {
-    // PTY 数据广播到所有 WebSocket 客户端
-    this.deps.onPtyData((data: string) => {
-      for (const client of this.clients) {
-        if (client.readyState === WebSocket.OPEN) {
-          client.send(data);
+    // PTY 数据广播到所有 WebSocket 客户端（可选）
+    if (this.deps.onPtyData) {
+      this.deps.onPtyData((data: string) => {
+        for (const client of this.clients) {
+          if (client.readyState === WebSocket.OPEN) {
+            client.send(data);
+          }
         }
-      }
-    });
+      });
+    }
 
     this.wss.on('connection', (ws, req) => {
       const ip = req.socket.remoteAddress;
       logger.info(this.tag, `WebSocket 连接: ${ip} (当前: ${this.clients.size + 1})`);
       this.clients.add(ws);
 
-      // Web 输入 → PTY（记录日志）
+      // Web 输入 → PTY（可选）
       ws.on('message', (msg: Buffer) => {
         const data = msg.toString();
         logger.info(this.tag, `Web 输入: ${JSON.stringify(data.slice(0, 50))}`);
-        this.deps.ptyWrite(data);
+        if (this.deps.ptyWrite) {
+          this.deps.ptyWrite(data);
+        }
       });
 
       ws.on('close', () => {
