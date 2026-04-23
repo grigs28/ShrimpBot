@@ -12,6 +12,7 @@ interface BotEntry {
   name: string;
   appId: string;
   appSecret: string;
+  chatIds?: string[];
 }
 
 const BOTS_PATH = path.join(os.homedir(), '.shrimpbot', 'bots.json');
@@ -136,12 +137,33 @@ async function selectChats(
 }
 
 function saveShrimpBotState(bot: BotEntry, chatIds: string[]): void {
+  // chatIds 写入 bots.json 对应 bot entry
+  const bots = loadBots();
+  const entry = bots.find(b => b.appId === bot.appId);
+  if (entry) {
+    entry.chatIds = chatIds;
+    saveBots(bots);
+  }
+
+  // config.json 只存 activeBotName + claudeCwd
   saveShrimpBotConfig({
     activeBotName: bot.name,
-    chatIds,
     claudeCwd: process.cwd(),
   });
-  console.log(`\n✅ 已保存到 ~/.shrimpbot/config.json`);
+  console.log(`\n✅ 已保存到 ~/.shrimpbot/`);
+
+  // 写入/更新本地 .sbot（项目级配置，含 FEISHU_BOT_NAME）
+  const sbotPath = path.join(process.cwd(), '.sbot');
+  let lines: string[] = [];
+  if (fs.existsSync(sbotPath)) {
+    lines = fs.readFileSync(sbotPath, 'utf-8').split('\n').filter(l => !l.startsWith('FEISHU_BOT_NAME=') && l.trim());
+  }
+  if (!lines.includes('FEISHU_MODE=bridge')) {
+    lines.push('FEISHU_MODE=bridge');
+  }
+  lines.push(`FEISHU_BOT_NAME=${bot.name}`);
+  fs.writeFileSync(sbotPath, lines.join('\n') + '\n');
+  console.log(`📝 已更新 .sbot: FEISHU_BOT_NAME=${bot.name}`);
 }
 
 /**

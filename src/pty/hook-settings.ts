@@ -2,8 +2,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { logger } from '../logger.js';
 
-const HOOK_COMMAND_TEMPLATE = (port: number) =>
-  `curl -s -X POST http://localhost:${port}/api/hook -H 'Content-Type: application/json' -d @-`;
+const HOOK_COMMAND_TEMPLATE = (port: number, botName?: string) => {
+  const botParam = botName ? `?bot=${encodeURIComponent(botName)}` : '';
+  return `curl -s -X POST http://localhost:${port}/api/hook${botParam} -H 'Content-Type: application/json' -d @-`;
+};
 
 const HOOK_EVENTS = ['Stop', 'Notification', 'PostToolUseFailure'] as const;
 
@@ -11,7 +13,7 @@ const HOOK_EVENTS = ['Stop', 'Notification', 'PostToolUseFailure'] as const;
  * 确保 .claude/settings.local.json 中包含 ShrimpBot 所需的 hook 配置
  * 保留现有配置（如 permissions），只合并/更新 hooks 部分
  */
-export function ensureHookSettings(port: number): void {
+export function ensureHookSettings(port: number, botName?: string): void {
   const claudeDir = path.join(process.cwd(), '.claude');
   const settingsPath = path.join(claudeDir, 'settings.local.json');
 
@@ -30,7 +32,7 @@ export function ensureHookSettings(port: number): void {
     }
   }
 
-  const hookCommand = HOOK_COMMAND_TEMPLATE(port);
+  const hookCommand = HOOK_COMMAND_TEMPLATE(port, botName);
   const existingHooks = (settings.hooks || {}) as Record<string, unknown>;
 
   // 构建新的 hooks 配置
@@ -60,5 +62,5 @@ export function ensureHookSettings(port: number): void {
   settings.hooks = newHooks;
 
   fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
-  logger.info('HookSettings', `Hook 配置已写入 ${settingsPath} (端口: ${port})`);
+  logger.info('HookSettings', `Hook 配置已写入 ${settingsPath} (端口: ${port}, bot: ${botName || 'local'})`);
 }

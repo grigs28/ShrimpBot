@@ -47,6 +47,8 @@ export class FeishuBridge {
   private passthrough = false;
   private streamBuffer = '';
   private completionHandled = false;
+  /** PTY ❯ 已出现（Claude 空闲），等待 Stop hook 带 transcript 完成卡片 */
+  private ptyReady = false;
   /** PTY 完成时的兜底内容（Hook Stop 未触发时使用） */
   private fallbackPtyText = '';
   /** 最后一次 Hook Stop 传入的 transcript_path */
@@ -71,6 +73,8 @@ export class FeishuBridge {
 
   /** 远程 WebServer 连接（端口被占时通过 WebSocket 连接） */
   private remoteWebWs: WS | null = null;
+  /** 是否已停止（防止 stop 后继续重连） */
+  private stopped = false;
 
   /** Stop Hook 动态等待：PTY 输出停止更新时触发 */
   private stopHookTimer: ReturnType<typeof setTimeout> | null = null;
@@ -311,6 +315,7 @@ export class FeishuBridge {
     this.defaultChatId = event.chatId;
     this.lastUserMessage = text;
     this.completionHandled = false;
+    this.ptyReady = false;
     this.notificationSent = false;
 
     const chatLabel = event.chatType === 'p2p' ? '私聊' : '群聊';
@@ -354,6 +359,7 @@ export class FeishuBridge {
 
     // 重置状态
     this.completionHandled = false;
+    this.ptyReady = false;
     this.notificationSent = false;
     this.streamBuffer = '';
     this.fallbackPtyText = '';
@@ -471,9 +477,12 @@ export class FeishuBridge {
         this.enqueueSend(targetChatId, fullText, true, `完成: ${fullText.length}字`);
       }
     } else {
-      // 非 clone 模式：❯ 仅作加速信号，内容从 transcript 读取
-      logger.info(this.tag, `PTY ❯ → 加速完成 (${fullText.length}字)`);
-      if (!this.completionHandled) {
+      // 非 clone 模式：❯ 只标记 PTY 就绪，等 Stop hook 带 transcript 完成卡片
+      this.ptyReady = true;
+      this.fallbackPtyText = fullText;
+      logger.info(this.tag, `PTY ❯ 就绪 (${fullText.length}字), 等 Stop hook`);
+      // 如果 Stop 已经先到了（已有 transcript），立即完成
+      if (this.lastTranscriptPath && !this.completionHandled) {
         if (this.stopHookTimer) clearTimeout(this.stopHookTimer);
         this.doFinalPatch();
       }
@@ -878,21 +887,27 @@ export class FeishuBridge {
       case 'Stop': {
         if (event.stop_hook_active) return; // 防止循环
         if (event.transcript_path) this.lastTranscriptPath = event.transcript_path;
-        logger.info(this.tag, `Hook Stop: completionHandled=${this.completionHandled}, currentCardId=${!!this.currentCardId}`);
+        logger.info(this.tag, `Hook Stop: completionHandled=${this.completionHandled}, ptyReady=${this.ptyReady}, currentCardId=${!!this.currentCardId}`);
         // 非 clone 模式：Stop 驱动完成卡片
         if (!this.config.clone && !this.completionHandled) {
-          // 每次 Stop 重置 timer
+          // PTY 已就绪（❯ 已到）→ 立即完成（不再等 debounce）
+          if (this.ptyReady && this.lastTranscriptPath) {
+            if (this.stopHookTimer) clearTimeout(this.stopHookTimer);
+            if (this.completionTimer) clearTimeout(this.completionTimer);
+            this.doFinalPatch();
+            return;
+          }
+          // PTY 未就绪 → 中间 Stop，debounce 3s 更新进度
           if (this.stopHookTimer) clearTimeout(this.stopHookTimer);
           this.stopHookTimer = setTimeout(() => {
             if (this.completionHandled) { this.processQueue(); return; }
             const content = this.readLastAssistantFromTranscript(this.lastTranscriptPath);
-            logger.info(this.tag, `Hook Stop (debounced): transcript=${content.length}字`);
+            logger.info(this.tag, `Hook Stop (进度): transcript=${content.length}字`);
             if (content.trim() && this.currentCardId) {
-              // 中间 Stop → 进度更新
               this.patchCard('blue', '🔄 处理中', content, true);
             }
           }, 3000);
-          // 兜底完成：如果 ❯ 一直没来，8s 后自动完成
+          // 兜底：如果 ❯ 一直没来，8s 后自动完成
           if (this.completionTimer) clearTimeout(this.completionTimer);
           this.completionTimer = setTimeout(() => {
             if (!this.completionHandled) {
@@ -1066,53 +1081,69 @@ export class FeishuBridge {
   /** 连接到远程 WebServer 作为 bot 提供者（PTY 数据推送 + Web 输入接收 + Hook 事件接收） */
   private connectToRemoteWebServer(port: number): Promise<void> {
     return new Promise((resolve, reject) => {
-      const ws = new WS(`ws://127.0.0.1:${port}/ws/bot`);
+      const botId = this.config.botName || 'ShrimpBot';
+      let reconnectDelay = 1000;
       let settled = false;
 
-      ws.on('open', () => {
-        // 标识自己
-        ws.send(JSON.stringify({ type: 'bot-join', name: this.config.botName || 'ShrimpBot' }));
+      const connect = () => {
+        const ws = new WS(`ws://127.0.0.1:${port}/ws/bot`);
 
-        // PTY 数据 → 远程 WebServer → 浏览器
-        this.pty.onRawData((data: string) => {
-          if (ws.readyState === WS.OPEN) {
-            ws.send(JSON.stringify({ type: 'pty-data', data }));
-          }
+        ws.on('open', () => {
+          // 标识自己
+          ws.send(JSON.stringify({ type: 'bot-join', name: botId }));
+          reconnectDelay = 1000; // 连接成功，重置重连间隔
+
+          // PTY 数据 → 远程 WebServer → 浏览器（附带 botName）
+          this.pty.onRawData((data: string) => {
+            if (ws.readyState === WS.OPEN) {
+              ws.send(JSON.stringify({ type: 'pty-data', data, name: botId }));
+            }
+          });
+
+          if (!settled) { settled = true; resolve(); }
         });
 
-        if (!settled) { settled = true; resolve(); }
-      });
-
-      ws.on('message', (msg: Buffer) => {
-        try {
-          const parsed = JSON.parse(msg.toString());
-          if (parsed.type === 'web-input' && typeof parsed.data === 'string') {
-            // Web 输入 → PTY
-            if (!this.firstMessageReceived && /[^\x00-\x1f\x7f]/.test(parsed.data)) {
-              this.firstMessageReceived = true;
-              logger.info(this.tag, 'Web 输入触发，开始转发 Claude 输出');
+        ws.on('message', (msg: Buffer) => {
+          try {
+            const parsed = JSON.parse(msg.toString());
+            if (parsed.type === 'web-input' && typeof parsed.data === 'string') {
+              // 过滤非目标 bot 的消息（多咪时只处理发给自己的）
+              if (parsed.targetBot && parsed.targetBot !== botId) return;
+              // Web 输入 → PTY
+              if (!this.firstMessageReceived && /[^\x00-\x1f\x7f]/.test(parsed.data)) {
+                this.firstMessageReceived = true;
+                logger.info(this.tag, 'Web 输入触发，开始转发 Claude 输出');
+              }
+              if (parsed.data.includes('\r') && this.completionHandled && this.firstMessageReceived) {
+                this.handleExternalCommand();
+              }
+              this.pty.writeRaw(parsed.data);
+            } else if (parsed.type === 'hook' && parsed.event) {
+              // Hook 事件 → 本地处理
+              this.handleHookEvent(parsed.event as HookEvent);
             }
-            if (parsed.data.includes('\r') && this.completionHandled && this.firstMessageReceived) {
-              this.handleExternalCommand();
-            }
-            this.pty.writeRaw(parsed.data);
-          } else if (parsed.type === 'hook' && parsed.event) {
-            // Hook 事件 → 本地处理
-            this.handleHookEvent(parsed.event as HookEvent);
-          }
-        } catch { /* ignore */ }
-      });
+          } catch { /* ignore */ }
+        });
 
-      ws.on('error', (err) => {
-        if (!settled) { settled = true; reject(err); }
-      });
+        ws.on('error', (err) => {
+          if (!settled) { settled = true; reject(err); return; }
+          logger.warn(this.tag, `WebServer 连接错误: ${err.message}`);
+        });
 
-      ws.on('close', () => {
-        this.remoteWebWs = null;
-        logger.warn(this.tag, '与 WebServer 的连接已断开');
-      });
+        ws.on('close', () => {
+          this.remoteWebWs = null;
+          logger.warn(this.tag, `与 WebServer 的连接已断开，${reconnectDelay / 1000}s 后重连`);
+          // 自动重连（指数退避，最大 30s）
+          setTimeout(() => {
+            reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+            if (!this.stopped) connect();
+          }, reconnectDelay);
+        });
 
-      this.remoteWebWs = ws;
+        this.remoteWebWs = ws;
+      };
+
+      connect();
 
       setTimeout(() => {
         if (!settled) { settled = true; reject(new Error('连接超时')); }
@@ -1121,6 +1152,7 @@ export class FeishuBridge {
   }
 
   stop(): void {
+    this.stopped = true;
     if (this.sendTimer) { clearTimeout(this.sendTimer); this.sendTimer = null; }
     if (this.optionTimer) { clearTimeout(this.optionTimer); this.optionTimer = null; }
     if (this.busyTimer) { clearTimeout(this.busyTimer); this.busyTimer = null; }

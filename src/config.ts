@@ -11,6 +11,7 @@ interface BotEntry {
   name: string;
   appId: string;
   appSecret: string;
+  chatIds?: string[];
 }
 
 interface ShrimpBotConfig {
@@ -61,14 +62,20 @@ export function updateShrimpBotConfig(partial: Partial<ShrimpBotConfig>): void {
   saveShrimpBotConfig(merged);
 }
 
-/** 追加 chatId（去重） */
+/** 追加 chatId 到当前活跃 bot（去重） */
 export function addChatId(chatId: string): void {
   const config = loadShrimpBotConfig();
-  const ids = config.chatIds || [];
-  if (!ids.includes(chatId)) {
-    ids.push(chatId);
-    config.chatIds = ids;
-    saveShrimpBotConfig(config);
+  const botName = config.activeBotName;
+  if (!botName) return;
+
+  const bots = loadBotsRegistry();
+  const bot = bots.find(b => b.name === botName);
+  if (!bot) return;
+
+  if (!bot.chatIds) bot.chatIds = [];
+  if (!bot.chatIds.includes(chatId)) {
+    bot.chatIds.push(chatId);
+    saveBotsRegistry(bots);
   }
 }
 
@@ -115,17 +122,18 @@ export function loadSingleBotConfig(): BotConfig {
     };
   }
 
-  // 2. 从 config.json 的 activeBotName 查找 bots.json
+  // 2. 从环境变量（.sbot）或 config.json 的 activeBotName 查找 bots.json
   const shrimpConfig = loadShrimpBotConfig();
+  const botName = process.env.FEISHU_BOT_NAME || shrimpConfig.activeBotName;
 
-  if (shrimpConfig.activeBotName) {
-    const bot = findBotByName(shrimpConfig.activeBotName);
+  if (botName) {
+    const bot = findBotByName(botName);
     if (bot) {
       return {
         name: bot.name,
         appId: bot.appId,
         appSecret: bot.appSecret,
-        chatIds: shrimpConfig.chatIds || [],
+        chatIds: bot.chatIds || [],
       };
     }
   }
@@ -138,7 +146,7 @@ export function loadSingleBotConfig(): BotConfig {
       name: bot.name,
       appId: bot.appId,
       appSecret: bot.appSecret,
-      chatIds: shrimpConfig.chatIds || [],
+      chatIds: bot.chatIds || [],
     };
   }
 

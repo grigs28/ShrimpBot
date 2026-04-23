@@ -346,7 +346,7 @@ async function startBridgeMode(): Promise<void> {
 
   // 写入 hook 配置到 .claude/settings.local.json
   const webPort = parseInt(process.env.WEB_PORT || '5554', 10);
-  ensureHookSettings(webPort);
+  ensureHookSettings(webPort, botName);
 
   const bridge = new FeishuBridge({
     feishuAppId: appId,
@@ -386,10 +386,9 @@ async function startBridgeMode(): Promise<void> {
 }
 
 /** 保存活跃 bot 到 ~/.shrimpbot/config.json */
-function saveActiveBot(botName: string, chatIds: string[]): void {
+function saveActiveBot(botName: string): void {
   saveShrimpBotConfig({
     activeBotName: botName,
-    chatIds,
     claudeCwd: process.cwd(),
   });
   console.log(`✅ 已切换到 "${botName}"，配置写入 ~/.shrimpbot/config.json`);
@@ -407,7 +406,7 @@ async function handleInit(): Promise<void> {
     const chatIds = cliArgs.chatId ? [cliArgs.chatId] : [] as string[];
 
     const botsPath = path.join(os.homedir(), '.shrimpbot', 'bots.json');
-    let bots: Array<{ name: string; appId: string; appSecret: string }> = [];
+    let bots: Array<{ name: string; appId: string; appSecret: string; chatIds?: string[] }> = [];
     if (fs.existsSync(botsPath)) {
       try { bots = JSON.parse(fs.readFileSync(botsPath, 'utf-8')); } catch { /* ignore */ }
     }
@@ -416,9 +415,10 @@ async function handleInit(): Promise<void> {
     if (existing) {
       if (cliArgs.appSecret) existing.appSecret = cliArgs.appSecret;
       if (cliArgs.name) existing.name = name;
+      if (chatIds.length > 0) existing.chatIds = chatIds;
       console.log(`✅ 已更新 Bot "${existing.name}" (${cliArgs.appId})`);
     } else {
-      bots.push({ name, appId: cliArgs.appId, appSecret: cliArgs.appSecret });
+      bots.push({ name, appId: cliArgs.appId, appSecret: cliArgs.appSecret, chatIds });
       console.log(`✅ 已添加 Bot "${name}" (${cliArgs.appId})`);
     }
 
@@ -426,8 +426,21 @@ async function handleInit(): Promise<void> {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(botsPath, JSON.stringify(bots, null, 2));
 
-    // 写 config.json（切换活跃 bot，不写 .env）
-    saveActiveBot(name, chatIds);
+    // config.json 只切换活跃 bot
+    saveActiveBot(name);
+
+    // 写入/更新本地 .sbot（项目级 FEISHU_BOT_NAME）
+    const sbotPath = path.join(process.cwd(), '.sbot');
+    let lines: string[] = [];
+    if (fs.existsSync(sbotPath)) {
+      lines = fs.readFileSync(sbotPath, 'utf-8').split('\n').filter(l => !l.startsWith('FEISHU_BOT_NAME=') && l.trim());
+    }
+    if (!lines.includes('FEISHU_MODE=bridge')) {
+      lines.push('FEISHU_MODE=bridge');
+    }
+    lines.push(`FEISHU_BOT_NAME=${name}`);
+    fs.writeFileSync(sbotPath, lines.join('\n') + '\n');
+    console.log(`📝 已更新 .sbot: FEISHU_BOT_NAME=${name}`);
     return;
   }
 
