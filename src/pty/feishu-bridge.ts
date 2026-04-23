@@ -46,6 +46,9 @@ export class FeishuBridge {
 
   private passthrough = false;
   private streamBuffer = '';
+  private completionHandled = false;
+  /** PTY 完成时的兜底内容（Hook Stop 未触发时使用） */
+  private fallbackPtyText = '';
   /** 是否已收到第一条飞书消息（启动前的 PTY 输出不发送到飞书） */
   private firstMessageReceived = false;
 
@@ -64,6 +67,12 @@ export class FeishuBridge {
 
   /** 远程 WebServer 连接（端口被占时通过 WebSocket 连接） */
   private remoteWebWs: WS | null = null;
+
+  /** Stop Hook 动态等待：PTY 输出停止更新时触发 */
+  private stopHookTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly STOP_HOOK_CHECK_INTERVAL_MS = 1000; // 检查间隔（1秒）
+  private readonly STOP_HOOK_MAX_WAIT_MS = 15000; // 最长等待时间（15秒）
+  private stopHookWaitStartTime = 0;
 
   /** 非 clone 模式：当前 interactive 卡片的 messageId（用于 patch 更新） */
   private currentCardId: string | null = null;
@@ -288,6 +297,7 @@ export class FeishuBridge {
     this.responseChatId = event.chatId;
     this.defaultChatId = event.chatId;
     this.lastUserMessage = text;
+    this.completionHandled = false;
 
     const chatLabel = event.chatType === 'p2p' ? '私聊' : '群聊';
     logger.info(this.tag, `[${chatLabel}] 飞书 → Claude: "${text.slice(0, 100)}" (${event.chatId})`);
@@ -351,12 +361,23 @@ export class FeishuBridge {
     }
 
     if (!isComplete) {
-      // 流式累积（只记录不发）
-      this.streamBuffer = text;
+      // 流式累积（只记录不发，完成后停止更新防止覆盖）
+      if (!this.completionHandled) {
+        // 优先用 PTY buffer（包含表格等未 flush 内容）
+        const bufferText = this.pty.getBufferText();
+        this.streamBuffer = bufferText || text;
+      }
       return;
     }
 
     // === 完整回复 ===
+
+    // 防双重 patch：Stop hook 可能已处理过
+    if (this.completionHandled) {
+      this.streamBuffer = '';
+      return;
+    }
+    this.completionHandled = true;
 
     const hasOptions = this.containsNumberedOptions(text);
 
@@ -392,24 +413,36 @@ export class FeishuBridge {
       return;
     }
 
-    // 完成时：用 streamBuffer（累积的完整内容）而非 text（可能只是 ● 行）
-    const fullText = this.streamBuffer || text;
+    const fullText = text || this.streamBuffer;
     this.streamBuffer = '';
 
     if (this.config.clone) {
-      // clone 模式：发新消息（不变）
+      // clone 模式：发新消息
       if (fullText.trim()) {
         this.enqueueSend(targetChatId, fullText, true, `完成: ${fullText.length}字`);
       }
     } else {
-      // 非 clone 模式：patch 卡片（🟢 完成）
-      if (fullText.trim()) {
-        const sendText = this.cleanForMarkdown(fullText);
-        this.patchCard('green', '🟢 完成', sendText);
-      }
+      // 非 clone 模式：不在这里 patch 卡片！
+      // PTY 解析的内容可能不完整（如表格只有表头），
+      // 等 Hook Stop 从 transcript 拿到完整干净内容再 patch。
+      // 这里只保存 buffer 作为兜底（Hook 没触发时用）。
+      this.completionHandled = false; // 不标记，留给 Hook Stop
+      this.fallbackPtyText = fullText; // 兜底内容
+      logger.info(this.tag, `PTY 完成信号: ${fullText.length}字，等 Hook Stop 处理`);
+      // 5 秒后 Hook Stop 还没来就用 PTY 内容兜底
+      if (this.stopHookTimer) clearTimeout(this.stopHookTimer);
+      this.stopHookTimer = setTimeout(() => {
+        if (!this.completionHandled && this.fallbackPtyText) {
+          logger.info(this.tag, `Hook Stop 超时，用 PTY 内容兜底`);
+          this.completionHandled = true;
+          this.patchCard('green', '🟢 完成', this.cleanForMarkdown(this.fallbackPtyText));
+        }
+        this.processQueue();
+      }, 5000);
+      return;
     }
 
-    // 检查选项（clone 和非 clone 都需要）
+    // 检查选项
     if (this.looksLikeQuestion(text)) {
       this.pendingOptions = [];
       if (this.optionTimer) clearTimeout(this.optionTimer);
@@ -526,7 +559,9 @@ export class FeishuBridge {
     this.currentCardChatId = null;
   }
 
-  /** 构建飞书 interactive 卡片 JSON */
+  /** 构建飞书 interactive 卡片 JSON
+   *  自动检测 markdown 表格并转为飞书原生 table 组件
+   */
   private buildCard(color: string, title: string, content: string): Record<string, unknown> {
     const card: Record<string, unknown> = {
       config: { wide_screen_mode: true },
@@ -537,10 +572,114 @@ export class FeishuBridge {
       elements: [] as Record<string, unknown>[],
     };
     const elements = card.elements as Record<string, unknown>[];
-    if (content) {
-      elements.push({ tag: 'markdown', content });
+
+    if (!content) return card;
+
+    // 尝试提取 markdown 表格并转为飞书原生 table 组件
+    const parts = this.splitTableContent(content);
+    for (const part of parts) {
+      if (part.type === 'table') {
+        elements.push(part.tableJson!);
+      } else {
+        const text = part.text.trim();
+        if (text) elements.push({ tag: 'markdown', content: text });
+      }
     }
+
     return card;
+  }
+
+  /** 将内容拆分为 text 段和 table 段 */
+  private splitTableContent(content: string): Array<{ type: 'text'; text: string } | { type: 'table'; tableJson: Record<string, unknown> }> {
+    const lines = content.split('\n');
+    const result: Array<{ type: 'text'; text: string } | { type: 'table'; tableJson: Record<string, unknown> }> = [];
+    let textBuffer: string[] = [];
+
+    const flushText = () => {
+      if (textBuffer.length > 0) {
+        result.push({ type: 'text', text: textBuffer.join('\n') });
+        textBuffer = [];
+      }
+    };
+
+    // 检测 markdown 表格：| ... | 格式，紧跟 | --- | 分隔行
+    const MD_TABLE_ROW = /^\s*\|.*\|\s*$/;
+    const MD_TABLE_SEP = /^\s*\|[\s\-:]+\|/;
+
+    let i = 0;
+    while (i < lines.length) {
+      // 找表头行
+      if (MD_TABLE_ROW.test(lines[i]!) && i + 1 < lines.length && MD_TABLE_SEP.test(lines[i + 1]!)) {
+        const headerLine = lines[i]!.trim();
+        i += 2; // 跳过表头和分隔行
+
+        // 收集数据行
+        const dataLines: string[] = [];
+        while (i < lines.length && MD_TABLE_ROW.test(lines[i]!)) {
+          dataLines.push(lines[i]!.trim());
+          i++;
+        }
+
+        // 解析表格
+        const tableJson = this.parseMdTable(headerLine, dataLines);
+        if (tableJson) {
+          flushText();
+          result.push({ type: 'table', tableJson });
+          continue;
+        }
+        // 解析失败，当作普通文本
+        textBuffer.push(headerLine);
+      }
+
+      textBuffer.push(lines[i]!);
+      i++;
+    }
+
+    flushText();
+    return result;
+  }
+
+  /** 解析 markdown 表格为飞书 table 组件 JSON */
+  private parseMdTable(headerLine: string, dataLines: string[]): Record<string, unknown> | null {
+    const parseCells = (line: string): string[] =>
+      line.split('|').map(c => c.trim()).filter(Boolean);
+
+    const headers = parseCells(headerLine);
+    if (headers.length < 2) return null;
+
+    // 列定义：用下标作为 name
+    const columns = headers.map((h, idx) => ({
+      name: `col_${idx}`,
+      display_name: h,
+      data_type: 'text' as string,
+      width: 'auto' as string,
+    }));
+
+    // 行数据
+    const rows = dataLines.map(line => {
+      const cells = parseCells(line);
+      const row: Record<string, string> = {};
+      columns.forEach((_, idx) => {
+        row[`col_${idx}`] = cells[idx] || '';
+      });
+      return row;
+    });
+
+    if (rows.length === 0) return null;
+
+    return {
+      tag: 'table',
+      page_size: Math.min(rows.length, 5),
+      row_height: 'low',
+      header_style: {
+        text_align: 'left',
+        text_size: 'normal',
+        background_style: 'grey',
+        bold: true,
+      },
+      columns,
+      rows,
+    };
   }
 
   /**
@@ -674,12 +813,29 @@ export class FeishuBridge {
     switch (event.hook_event_name) {
       case 'Stop': {
         if (event.stop_hook_active) return; // 防止循环
-        // 非 clone 模式：PTY 可能没检测到完成，这里用 buffer 内容兜底 patch
-        if (!this.config.clone && this.currentCardId) {
-          const bufferText = this.pty.getBufferText();
-          if (bufferText.trim()) {
-            const cleanText = this.cleanForMarkdown(bufferText);
-            this.patchCard('green', '🟢 完成', cleanText);
+        logger.info(this.tag, `Hook Stop: transcript_path=${event.transcript_path}, completionHandled=${this.completionHandled}, currentCardId=${!!this.currentCardId}`);
+        // 非 clone 模式：用 transcript 内容 patch 卡片
+        if (!this.config.clone && this.currentCardId && !this.completionHandled) {
+          // 优先从 transcript 读取干净的 assistant 回复
+          const content = this.readLastAssistantFromTranscript(event.transcript_path);
+          logger.info(this.tag, `Hook Stop: transcript 内容=${content.length}字, 预览="${content.slice(0, 100)}"`);
+          if (content.trim()) {
+            logger.info(this.tag, `Hook Stop: 从 transcript 读取到 ${content.length} 字`);
+            this.completionHandled = true;
+            this.patchCard('green', '🟢 完成', content);
+          } else {
+            // transcript 没读到内容（可能文件还没写入），等 1 秒再试一次
+            logger.info(this.tag, `Hook Stop: transcript 为空，1秒后重试`);
+            if (this.stopHookTimer) clearTimeout(this.stopHookTimer);
+            this.stopHookTimer = setTimeout(() => {
+              const retry = this.readLastAssistantFromTranscript(event.transcript_path);
+              if (retry.trim() && !this.completionHandled) {
+                this.completionHandled = true;
+                this.patchCard('green', '🟢 完成', retry);
+              }
+              this.processQueue();
+            }, 1000);
+            return;
           }
         }
         this.processQueue();
@@ -709,82 +865,71 @@ export class FeishuBridge {
     }
   }
 
-  private extractLastAssistantMessage(messages?: Array<{ role: string; content: string | Array<Record<string, unknown>> }>): string {
-    if (!messages || messages.length === 0) return '';
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i]!;
-      if (msg.role === 'assistant') {
-        const { content } = msg;
-        if (typeof content === 'string') {
-          return content.slice(0, 4000);
-        }
-        if (Array.isArray(content)) {
-          return content
-            .filter((b: Record<string, unknown>) => b.type === 'text')
-            .map((b: Record<string, unknown>) => (b as { text: string }).text)
-            .join('\n')
-            .slice(0, 4000);
-        }
+  /** 从 transcript JSONL 文件读取最后一条 assistant 消息
+   *  transcript 结构：每行 JSON，type="assistant" 的行有 message.role="assistant"
+   *  内容在 message.content 数组里（{type:"text", text:"..."} 和 {type:"tool_use", ...}）
+   */
+  private readLastAssistantFromTranscript(transcriptPath?: string): string {
+    if (!transcriptPath) return '';
+    try {
+      const raw = fs.readFileSync(transcriptPath, 'utf-8');
+      const lines = raw.trim().split('\n').filter(Boolean);
+
+      // 从后往前找最后一条有实质内容的 assistant 消息
+      // 跳过 "No response requested." 等空回复
+      for (let i = lines.length - 1; i >= 0; i--) {
+        try {
+          const entry = JSON.parse(lines[i]!);
+          if (entry.type === 'assistant' && entry.message) {
+            const msg = entry.message;
+            const content = msg.content;
+            if (typeof content === 'string') {
+              if (content.trim().length > 50) return content;
+              continue; // 太短，跳过
+            }
+            if (Array.isArray(content)) {
+              const texts = content
+                .filter((b: any) => b.type === 'text' && b.text)
+                .map((b: any) => b.text as string);
+              const joined = texts.join('\n').trim();
+              // 跳过空回复和无实质内容
+              if (joined.length > 50 && !/^no response/i.test(joined)) return joined;
+            }
+          }
+        } catch { /* 跳过解析失败的行 */ }
       }
+    } catch (err) {
+      logger.warn(this.tag, `读取 transcript 失败: ${err}`);
     }
     return '';
   }
 
   // ========== 文本清洗（非 clone 模式） ==========
 
-  /** 清洗 TUI 表格等，转换为 Markdown 友好格式 */
+  /** 清洗 TUI 输出，转换为 Markdown 友好格式
+   * 注意：OutputParser 已经把 TUI 表格转为 markdown，这里只做简单清理
+   */
   private cleanForMarkdown(text: string): string {
     const lines = text.split('\n');
     const result: string[] = [];
-    let inTable = false;
-    let tableRows: string[] = [];
 
     for (const line of lines) {
       const t = line.trim();
 
-      // 纯边框行（┌───┬───┐ 等）
+      // 跳过纯边框行（┌───┬───┐ 等）—— OutputParser 已处理表格
       if (/^[╭╮╰╯┌┐└┘├┤┬┴┼─━═│┃]+$/.test(t)) {
-        if (!inTable && tableRows.length > 0) {
-          // 表格开始，标记
-          inTable = true;
-        }
-        continue; // 跳过所有纯边框行
+        continue;
       }
 
-      // 表格内容行（含 │ 分隔）→ 收集并转为 markdown 表格
-      if (/^│.*│$/.test(t) || /^[|].*[|]$/.test(t)) {
-        // 提取单元格
-        const cells = t.split(/[│|]/).map(c => c.trim()).filter(Boolean);
-        if (cells.length >= 2) {
-          tableRows.push('| ' + cells.join(' | ') + ' |');
-          inTable = true;
-          continue;
+      // 跳过已经是 markdown 分隔线的重复行
+      if (/^\|\s*[-:]+\s*\|/.test(t) && result.length > 0) {
+        const lastLine = result[result.length - 1]!.trim();
+        if (/^\|\s*[-:]+\s*\|/.test(lastLine)) {
+          continue; // 跳过重复的分隔线
         }
-      }
-
-      // 非表格行：先把收集的表格输出
-      if (inTable && tableRows.length > 0) {
-        // 第一行后加分隔线
-        if (tableRows.length >= 1) {
-          const cols = tableRows[0]!.split('|').filter(Boolean).length;
-          tableRows.splice(1, 0, '| ' + Array(cols).fill('---').join(' | ') + ' |');
-        }
-        result.push(...tableRows);
-        result.push(''); // 表格后空行
-        tableRows = [];
-        inTable = false;
       }
 
       result.push(line);
-    }
-
-    // 末尾残余表格
-    if (tableRows.length > 0) {
-      if (tableRows.length >= 1) {
-        const cols = tableRows[0]!.split('|').filter(Boolean).length;
-        tableRows.splice(1, 0, '| ' + Array(cols).fill('---').join(' | ') + ' |');
-      }
-      result.push(...tableRows);
     }
 
     return result.join('\n');
@@ -901,6 +1046,7 @@ export class FeishuBridge {
     if (this.sendTimer) { clearTimeout(this.sendTimer); this.sendTimer = null; }
     if (this.optionTimer) { clearTimeout(this.optionTimer); this.optionTimer = null; }
     if (this.busyTimer) { clearTimeout(this.busyTimer); this.busyTimer = null; }
+    if (this.stopHookTimer) { clearTimeout(this.stopHookTimer); this.stopHookTimer = null; }
     this.pendingOptions = [];
     this.waitingForAnswer = false;
     this.messageQueue = [];

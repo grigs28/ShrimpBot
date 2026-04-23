@@ -104,7 +104,10 @@ export class WebServer {
     // API: Claude Code Hook 事件 → 转发给远程 bot 或本地回调
     this.app.post('/api/hook', (req, res) => {
       const event = req.body as HookEvent;
-      logger.info(this.tag, `Hook 事件: ${event.hook_event_name}`);
+      const keys = Object.keys(req.body);
+      const hasTranscript = !!(event as any).transcript_messages;
+      const msgCount = hasTranscript ? (event as any).transcript_messages.length : 0;
+      logger.info(this.tag, `Hook 原始数据: ${event.hook_event_name}, keys=[${keys.join(',')}], transcript=${hasTranscript}(${msgCount}条)`);
       if (this.botWs && this.botWs.readyState === WebSocket.OPEN) {
         this.botWs.send(JSON.stringify({ type: 'hook', event }));
       }
