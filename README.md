@@ -1,6 +1,6 @@
 # ShrimpBot / 🦐
 
-飞书 ↔ Claude Code 实时通信桥。通过 PTY 启动 Claude Code，实现飞书和终端双向同步交互。
+飞书 ↔ Claude Code 实时通信桥。通过 PTY 启动 Claude Code，实现飞书、终端、Web 三端同步交互。
 
 支持**多群聊**和**单人私聊**同时工作，自动发现新会话并记录。
 
@@ -11,7 +11,9 @@ npm install && npm run build
 sbot
 ```
 
-首次启动自动引导配置。也可以用 `sbot init` 初始化：
+无参数启动 = 全功能：自动检测端口、加载配置、启动三端。
+
+首次启动或空项目目录自动进入配置向导（选择哪只咪）。也可以用 `sbot init` 手动初始化：
 
 ```bash
 # 交互式配置
@@ -42,30 +44,37 @@ CLAUDE_CWD=/path/to/project
 | **Bot 注册表** | `~/.shrimpbot/bots.json` | 所有 Bot 的 appId/appSecret |
 | **环境变量** | 命令行或系统 | 最高优先级，覆盖以上所有 |
 
+## 三端同步 / Three-Endpoint Sync
+
+终端、飞书、Web 三端**同步显示、同步控制**：
+
+| 端 | 能力 |
+|----|------|
+| **终端** | 完整 Claude Code TUI（透传模式），键盘直接操作 |
+| **飞书** | 交互式卡片，选项选择、确认、富文本 Markdown |
+| **Web** | 浏览器终端（端口 5554），实时 WebSocket |
+
+### 启动逻辑
+
+1. 检测端口 5554 → 没占用就自启 Web 服务，占用就连上去
+2. 检测项目配置 → 有就直接启动，空项目自动进 init 选咪
+3. 启动 PTY + 飞书 + Web 连接
+
+### 多咪架构
+
+```
+systemd sbot-web (独立 Web 服务, :5554)
+  ├── WebSocket ← sbot (小虾咪) — PTY + 飞书
+  └── WebSocket ← sbot (键盘咪) — PTY + 飞书
+      ↑ 未来 Web 端分 tab 显示各只咪
+```
+
 ## 多群和私聊 / Multi-Chat Support
 
-ShrimpBot 支持**同时**处理多个群聊和单人私聊：
-
 - **自动发现**：新的群聊或私聊消息到来时，自动记录到 `~/.shrimpbot/config.json`
-- **消息队列**：Claude 正在回复时，其他会话的消息自动排队，回复完成后按序处理
-- **精确路由**：每个回复都会发送到发起提问的会话，不会串聊
-- **排队通知**：排队时飞书会提示 `⏳ 排队中`
-
-### 工作流程
-
-```
-群聊A 用户发消息 → Claude 回复 → 回复发到群聊A
-         ↓ (同时)
-私聊B 用户发消息 → 排队等待 → Claude 回复完A后处理 → 回复发到私聊B
-```
-
-### 权限配置
-
-| 权限 | 说明 |
-|------|------|
-| `im:message` | 接收私聊消息 |
-| `im:message.group_at_msg` | 接收群聊中 @机器人 的消息 |
-| `im:message.group_msg` | 接收群聊中所有消息 |
+- **消息队列**：Claude 正在回复时，其他会话的消息自动排队，按序处理
+- **精确路由**：每个回复都发到发起提问的会话，不会串聊
+- **排队通知**：排队时飞书提示 `⏳ 排队中`
 
 ## CLI 参数 / CLI Options
 
@@ -80,14 +89,10 @@ sbot 选项:
   --cwd <目录>             Claude Code 工作目录
   --chat <chat_id>         指定飞书会话 ID
   --debug                  开启调试日志
-  --clone                  飞书与终端完全同步（多行完整显示）
+  --clone                  飞书全量同步模式（所有回复都发飞书）
+  --web                    启用 Web 终端
+  --web-server             独立 Web 服务（不启动 PTY/飞书）
   -h, --help               显示帮助
-
-init 选项:
-  --app-id <id>            飞书 App ID
-  --app-secret <secret>    飞书 App Secret
-  --name <名称>            Bot 名称
-  --chat <chat_id>         飞书会话 ID
 
 Claude 选项（全部透传给 Claude Code CLI）:
   -m, --model              指定模型
@@ -97,42 +102,30 @@ Claude 选项（全部透传给 Claude Code CLI）:
   ... 以及 Claude Code 支持的任何参数
 
 示例:
-  sbot                                 启动交互模式
+  sbot                                 全功能启动
   sbot init                            交互式初始化
-  sbot init --app-id cli_xxx --app-secret yyy --name "小虾虾"
-  sbot --clone                         飞书完全同步模式
-  sbot --web                           飞书+终端+Web 三端模式
+  sbot --clone                         飞书全量同步模式
   sbot --command "列出文件"             启动并自动执行命令
-  sbot --cwd /tmp --model claude-opus  sbot 参数 + Claude 参数混用
+  sbot --cwd /tmp -m claude-opus       sbot + Claude 参数混用
 ```
 
-## 双端交互 / Dual-Side Interaction
+## 模式说明 / Modes
 
-终端、飞书和 Web 可**同时操作**，互不干扰：
+| 模式 | 飞书消息 | 说明 |
+|------|----------|------|
+| **默认** | 交互式卡片 | 任务开始 → 🔵思考中，完成 → 🟢卡片更新，错误 → 🔴 |
+| `--clone` | 纯文本全量 | 所有完整回复都发飞书，原样发送 |
+| `--web-server` | 无 | 独立 Web 服务，供 sbot 连接 |
 
-| 端 Side | 能力 Capability |
-|---------|----------------|
-| **终端 Terminal** | 完整 Claude Code TUI 界面（透传模式），键盘直接操作 |
-| **飞书 Feishu** | 实时收发消息，选项选择、yes/no 确认，富文本 Markdown 渲染 |
-| **Web** | 浏览器终端界面（`--web` 启用），端口 5554 |
+## Claude Hooks 集成
 
-### 选项选择 / Option Selection
+自动配置 Claude Code hooks 推送事件：
 
-Claude 提出编号选项时，两端都能选择：
-- **终端**：直接在 Claude Code 中输入
-- **飞书**：回复编号即可
-
-### 自动确认 / Auto Approve
-
-yes/no 问题默认自动通过，但危险操作（`rm -rf`、`drop table` 等）需手动确认。
-
-### 退出 / Exit
-
-| 方式 Method | 说明 Description |
-|-------------|-----------------|
-| `/exit` in Claude | Claude 退出 → PTY 退出 → Bridge 自动退出 |
-| `Ctrl+C` | 直接退出 |
-| `Ctrl+D` | 直接退出 |
+| Hook 事件 | 用途 |
+|-----------|------|
+| `Stop` | 任务完成，更新飞书卡片 |
+| `Notification` | Claude 主动通知用户 |
+| `PostToolUseFailure` | 工具调用出错 |
 
 ## 架构 / Architecture
 
@@ -143,35 +136,40 @@ Web Browser ←WebSocket→ WebServer ←→ FeishuBridge
 
 Claude Code Hooks (Stop/Notification/Failure)
   └── curl POST /api/hook → WebServer → FeishuBridge → 飞书
+
+sbot ←WebSocket(/ws/bot)→ 独立 WebServer (systemd)
 ```
 
-| 组件 Component | 说明 Description |
-|----------------|-----------------|
-| **PTY** | node-pty 启动 Claude Code（`--dangerously-skip-permissions`） |
-| **OutputParser** | 解析 TUI 输出，提取回复和选项 |
-| **WSClient** | 飞书 WebSocket 长连接，实时收消息 |
-| **WebServer** | Web 终端 + Hook API 接收端点 |
-| **消息队列** | 多会话消息排队，按序处理 |
-| **透传 Passthrough** | 前台运行时 TUI 直接显示到终端 |
-| **Claude Hooks** | 自动配置 Stop/Notification/PostToolUseFailure 事件推送 |
+## 飞书权限 / Feishu Permissions
 
-### 模式说明 / Modes
-
-| 模式 | 说明 |
+| 权限 | 说明 |
 |------|------|
-| `--clone` | 飞书全量同步：所有完整回复都发送到飞书 |
-| 默认（无 --clone） | 通知模式：任务完成、错误、选择项、危险操作等关键事件发飞书 |
-| `--web` | 启用 Web 终端，无飞书配置时为纯 Web 模式 |
+| `im:message` | 接收私聊消息 |
+| `im:message.group_at_msg` | 接收群聊中 @机器人 的消息 |
+| `im:message.group_msg` | 接收群聊中所有消息 |
 
 ## 多 Bot 配置 / Multi-Bot
 
-统一配置 `~/.shrimpbot/bots.json`：
+`~/.shrimpbot/bots.json`：
 
 ```json
 [
   {"name": "小虾虾", "appId": "cli_xxx", "appSecret": "secret1"},
-  {"name": "大虾虾", "appId": "cli_yyy", "appSecret": "secret2"}
+  {"name": "键盘咪", "appId": "cli_yyy", "appSecret": "secret2"}
 ]
+```
+
+`sbot init` 选择要用的那只咪，写入 `~/.shrimpbot/config.json`。
+
+## systemd 服务
+
+```bash
+# 独立 Web 服务（只跑 Web UI + Hook API，不启动 PTY/飞书）
+sudo cp contrib/sbot-web.service /etc/systemd/system/
+sudo systemctl enable --now sbot-web
+
+# 手动 sbot 时自动连上去（三端同步）
+sbot
 ```
 
 ## 日志 / Logs
@@ -184,23 +182,6 @@ Claude Code Hooks (Stop/Notification/Failure)
 sbot --debug        # 或
 LOG_LEVEL=debug sbot
 ```
-
-## systemd 服务 / systemd Service
-
-```bash
-# 独立 Web 服务（只跑 Web UI + Hook API，不启动 PTY/飞书）
-sudo cp contrib/sbot-web.service /etc/systemd/system/
-sudo systemctl enable --now sbot-web
-
-# 完整飞书+Web+终端模式
-sudo cp contrib/sbot-feishu.service /etc/systemd/system/
-sudo systemctl enable --now sbot-feishu
-```
-
-| 服务 | 说明 |
-|------|------|
-| `sbot-web.service` | 独立 Web 服务（`--web-server`），只提供 Web UI 和 Hook API |
-| `sbot-feishu.service` | 完整模式（PTY + 飞书 + Web），适合无人值守运行 |
 
 ## 开发 / Development
 
