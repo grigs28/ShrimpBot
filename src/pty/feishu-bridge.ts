@@ -65,6 +65,10 @@ export class FeishuBridge {
   /** 远程 WebServer 连接（端口被占时通过 WebSocket 连接） */
   private remoteWebWs: WS | null = null;
 
+  /** 非 clone 模式：当前 interactive 卡片的 messageId（用于 patch 更新） */
+  private currentCardId: string | null = null;
+  private currentCardChatId: string | null = null;
+
   private responseChatId = '';
   private defaultChatId = '';
   private knownChats = new Map<string, ChatInfo>();
@@ -291,6 +295,12 @@ export class FeishuBridge {
     this.pendingOptions = [];
     if (this.optionTimer) clearTimeout(this.optionTimer);
     this.claudeBusy = true;
+
+    // 非 clone 模式：发 🔵 思考中卡片
+    if (!this.config.clone) {
+      this.sendThinkingCard(event.chatId);
+    }
+
     this.sendToPty(text);
 
     // 安全超时：120 秒无完成响应则强制解除阻塞
@@ -354,7 +364,11 @@ export class FeishuBridge {
     if (!hasOptions && this.config.autoApprove !== false && (isYesNo || this.isYesNoQuestion(text))) {
       const isDangerous = FeishuBridge.DANGEROUS_PATTERNS.some(p => p.test(text));
       if (isDangerous) {
-        this.enqueueSend(targetChatId, `⚠️ 检测到潜在危险操作，需要手动确认：\n${text}`, true, '危险操作警告');
+        if (this.config.clone) {
+          this.enqueueSend(targetChatId, `⚠️ 检测到潜在危险操作，需要手动确认：\n${text}`, true, '危险操作警告');
+        } else {
+          this.patchCard('red', '🔴 危险操作', `⚠️ 检测到潜在危险操作，需要手动确认：\n${text}`);
+        }
         this.waitingForAnswer = true;
         if (!this.passthrough) {
           fs.writeSync(2, `\x1b[31m⚠️ 危险操作！请手动确认（飞书或终端输入 yes/no）：\n${text}\x1b[0m\n`);
@@ -364,7 +378,11 @@ export class FeishuBridge {
       }
 
       const approveMsg = `[自动通过] ${text}\n→ 已自动回复 yes`;
-      this.enqueueSend(targetChatId, approveMsg, true, '自动通过');
+      if (this.config.clone) {
+        this.enqueueSend(targetChatId, approveMsg, true, '自动通过');
+      } else {
+        this.patchCard('green', '🟢 自动通过', approveMsg);
+      }
       if (!this.passthrough) {
         fs.writeSync(2, `\x1b[36m${approveMsg}\x1b[0m\n`);
       }
@@ -378,11 +396,17 @@ export class FeishuBridge {
     const fullText = this.streamBuffer || text;
     this.streamBuffer = '';
 
-    // 发送完整回复（clone 和非 clone 都发，确保可靠性）
-    // 非 clone 模式清洗 TUI 表格等，clone 模式原样发送
-    if (fullText.trim()) {
-      const sendText = this.config.clone ? fullText : this.cleanForMarkdown(fullText);
-      this.enqueueSend(targetChatId, sendText, true, `完成: ${sendText.length}字`);
+    if (this.config.clone) {
+      // clone 模式：发新消息（不变）
+      if (fullText.trim()) {
+        this.enqueueSend(targetChatId, fullText, true, `完成: ${fullText.length}字`);
+      }
+    } else {
+      // 非 clone 模式：patch 卡片（🟢 完成）
+      if (fullText.trim()) {
+        const sendText = this.cleanForMarkdown(fullText);
+        this.patchCard('green', '🟢 完成', sendText);
+      }
     }
 
     // 检查选项（clone 和非 clone 都需要）
@@ -418,7 +442,11 @@ export class FeishuBridge {
     const optionText = options.map((opt, i) => `${i + 1}. ${opt}`).join('\n');
     const message = `📋 请回复编号选择：\n${optionText}`;
 
-    this.enqueueSend(targetChatId, message, false, '选项列表');
+    if (this.config.clone) {
+      this.enqueueSend(targetChatId, message, false, '选项列表');
+    } else {
+      this.patchCard('yellow', '🟡 等待选择', message);
+    }
     if (!this.passthrough) {
       const terminal = ['', '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
         '📋 Claude 提问，请回复编号（飞书或终端均可）：', optionText,
@@ -428,6 +456,92 @@ export class FeishuBridge {
   }
 
   // ========== 发送工具方法 ==========
+
+  // ========== 非 clone 模式：Interactive 卡片 ==========
+
+  /** 发送 🔵 思考中卡片（用户提问时） */
+  private async sendThinkingCard(chatId: string): Promise<void> {
+    this.currentCardId = null;
+    this.currentCardChatId = chatId;
+    try {
+      const resp = await this.feishuService.im.v1.message.create({
+        data: {
+          receive_id: chatId,
+          msg_type: 'interactive',
+          content: JSON.stringify(this.buildCard('blue', '🔵 思考中...', '')),
+        },
+        params: { receive_id_type: 'chat_id' },
+      });
+      this.currentCardId = resp.data?.message_id || null;
+      logger.info(this.tag, `🔵 思考中卡片已发送: ${this.currentCardId}`);
+    } catch (err) {
+      logger.error(this.tag, `发送思考卡片失败: ${err}`);
+    }
+  }
+
+  /** Patch 当前卡片（完成/错误/选项） */
+  private async patchCard(color: string, title: string, content: string): Promise<void> {
+    const chatId = this.currentCardChatId || this.responseChatId || this.defaultChatId;
+    if (!chatId) return;
+
+    // 截断到 28K
+    const truncated = content.length > 28000
+      ? content.slice(0, 14000) + '\n\n... (内容过长已截断) ...\n\n' + content.slice(-14000)
+      : content;
+
+    // 有 messageId → patch
+    if (this.currentCardId) {
+      try {
+        await this.feishuService.im.v1.message.patch({
+          path: { message_id: this.currentCardId },
+          data: { content: JSON.stringify(this.buildCard(color, title, truncated)) },
+        });
+        logger.info(this.tag, `卡片已更新: ${title}`);
+        this.currentCardId = null;
+        this.currentCardChatId = null;
+        return;
+      } catch (err) {
+        logger.warn(this.tag, `Patch 卡片失败，降级发新消息: ${err}`);
+        this.currentCardId = null;
+      }
+    }
+
+    // 无 messageId 或 patch 失败 → 发新卡片
+    try {
+      const resp = await this.feishuService.im.v1.message.create({
+        data: {
+          receive_id: chatId,
+          msg_type: 'interactive',
+          content: JSON.stringify(this.buildCard(color, title, truncated)),
+        },
+        params: { receive_id_type: 'chat_id' },
+      });
+      logger.info(this.tag, `新卡片已发送: ${title} (${resp.data?.message_id})`);
+    } catch (err) {
+      // 最后降级纯文本
+      logger.warn(this.tag, `卡片发送失败，降级 text: ${err}`);
+      this.enqueueSend(chatId, `${title}\n${truncated.slice(0, 4000)}`, false, title);
+    }
+    this.currentCardId = null;
+    this.currentCardChatId = null;
+  }
+
+  /** 构建飞书 interactive 卡片 JSON */
+  private buildCard(color: string, title: string, content: string): Record<string, unknown> {
+    const card: Record<string, unknown> = {
+      config: { wide_screen_mode: true },
+      header: {
+        template: color,
+        title: { content: title, tag: 'plain_text' },
+      },
+      elements: [] as Record<string, unknown>[],
+    };
+    const elements = card.elements as Record<string, unknown>[];
+    if (content) {
+      elements.push({ tag: 'markdown', content });
+    }
+    return card;
+  }
 
   /**
    * 入队发送（所有飞书发送必须经过此方法，确保串行化+限频）
@@ -567,14 +681,22 @@ export class FeishuBridge {
       case 'Notification': {
         const msg = event.message || event.title || '';
         if (msg) {
-          this.enqueueSend(targetChatId, `📢 ${msg}`, true, '通知');
+          if (this.config.clone) {
+            this.enqueueSend(targetChatId, `📢 ${msg}`, true, '通知');
+          } else {
+            this.patchCard('yellow', '📢 通知', msg);
+          }
         }
         break;
       }
       case 'PostToolUseFailure': {
         const toolName = event.tool_name || 'unknown';
         const error = event.error || '未知错误';
-        this.enqueueSend(targetChatId, `❌ 工具失败 **${toolName}**: ${error}`, true, '工具失败');
+        if (this.config.clone) {
+          this.enqueueSend(targetChatId, `❌ 工具失败 **${toolName}**: ${error}`, true, '工具失败');
+        } else {
+          this.patchCard('red', '🔴 工具失败', `**${toolName}**: ${error}`);
+        }
         break;
       }
     }
