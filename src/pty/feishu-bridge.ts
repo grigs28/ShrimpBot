@@ -813,30 +813,22 @@ export class FeishuBridge {
     switch (event.hook_event_name) {
       case 'Stop': {
         if (event.stop_hook_active) return; // 防止循环
-        logger.info(this.tag, `Hook Stop: transcript_path=${event.transcript_path}, completionHandled=${this.completionHandled}, currentCardId=${!!this.currentCardId}`);
-        // 非 clone 模式：用 transcript 内容 patch 卡片
+        const transcriptPath = event.transcript_path;
+        logger.info(this.tag, `Hook Stop: completionHandled=${this.completionHandled}, currentCardId=${!!this.currentCardId}`);
+        // 非 clone 模式：debounce，等 5 秒没有新 Stop 再 patch
         if (!this.config.clone && this.currentCardId && !this.completionHandled) {
-          // 优先从 transcript 读取干净的 assistant 回复
-          const content = this.readLastAssistantFromTranscript(event.transcript_path);
-          logger.info(this.tag, `Hook Stop: transcript 内容=${content.length}字, 预览="${content.slice(0, 100)}"`);
-          if (content.trim()) {
-            logger.info(this.tag, `Hook Stop: 从 transcript 读取到 ${content.length} 字`);
-            this.completionHandled = true;
-            this.patchCard('green', '🟢 完成', content);
-          } else {
-            // transcript 没读到内容（可能文件还没写入），等 1 秒再试一次
-            logger.info(this.tag, `Hook Stop: transcript 为空，1秒后重试`);
-            if (this.stopHookTimer) clearTimeout(this.stopHookTimer);
-            this.stopHookTimer = setTimeout(() => {
-              const retry = this.readLastAssistantFromTranscript(event.transcript_path);
-              if (retry.trim() && !this.completionHandled) {
-                this.completionHandled = true;
-                this.patchCard('green', '🟢 完成', retry);
-              }
-              this.processQueue();
-            }, 1000);
-            return;
-          }
+          if (this.stopHookTimer) clearTimeout(this.stopHookTimer);
+          this.stopHookTimer = setTimeout(() => {
+            if (this.completionHandled) { this.processQueue(); return; }
+            const content = this.readLastAssistantFromTranscript(transcriptPath);
+            logger.info(this.tag, `Hook Stop (debounced): transcript=${content.length}字, 预览="${content.slice(0, 100)}"`);
+            if (content.trim()) {
+              this.completionHandled = true;
+              this.patchCard('green', '🟢 完成', content);
+            }
+            this.processQueue();
+          }, 5000);
+          return; // 不 processQueue，等 debounce 结束再处理
         }
         this.processQueue();
         break;
