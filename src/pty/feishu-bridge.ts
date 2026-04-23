@@ -674,7 +674,14 @@ export class FeishuBridge {
     switch (event.hook_event_name) {
       case 'Stop': {
         if (event.stop_hook_active) return; // 防止循环
-        // PTY 已经发送了完整回复，这里只触发 processQueue
+        // 非 clone 模式：PTY 可能没检测到完成，这里用 buffer 内容兜底 patch
+        if (!this.config.clone && this.currentCardId) {
+          const bufferText = this.pty.getBufferText();
+          if (bufferText.trim()) {
+            const cleanText = this.cleanForMarkdown(bufferText);
+            this.patchCard('green', '🟢 完成', cleanText);
+          }
+        }
         this.processQueue();
         break;
       }
