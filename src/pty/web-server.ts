@@ -24,19 +24,38 @@ export interface WebServerDeps {
 export class WebServer {
   private app: express.Application;
   private server: http.Server;
-  private wss: WebSocketServer;
+  private wss: WebSocketServer;      // 浏览器客户端
+  private botWss: WebSocketServer;   // sbot 提供者
   private deps: WebServerDeps;
   private tag = 'WebServer';
   private clients = new Set<WebSocket>();
+  /** 远程连接的 bot 提供者（单咪先用一个） */
+  private botWs: WebSocket | null = null;
 
   constructor(deps: WebServerDeps, private port = 5554) {
     this.deps = deps;
     this.app = express();
     this.server = http.createServer(this.app);
-    this.wss = new WebSocketServer({ server: this.server });
+    this.wss = new WebSocketServer({ noServer: true });
+    this.botWss = new WebSocketServer({ noServer: true });
 
     this.setupRoutes();
     this.setupWebSocket();
+    this.setupBotWebSocket();
+
+    // WebSocket 路径路由：/ws/bot → bot 提供者，其他 → 浏览器客户端
+    this.server.on('upgrade', (request, socket, head) => {
+      const url = new URL(request.url || '/', `http://localhost`);
+      if (url.pathname === '/ws/bot') {
+        this.botWss.handleUpgrade(request, socket, head, (ws) => {
+          this.botWss.emit('connection', ws, request);
+        });
+      } else {
+        this.wss.handleUpgrade(request, socket, head, (ws) => {
+          this.wss.emit('connection', ws, request);
+        });
+      }
+    });
   }
 
   private setupRoutes(): void {
@@ -82,10 +101,13 @@ export class WebServer {
       });
     });
 
-    // API: Claude Code Hook 事件
+    // API: Claude Code Hook 事件 → 转发给远程 bot 或本地回调
     this.app.post('/api/hook', (req, res) => {
       const event = req.body as HookEvent;
       logger.info(this.tag, `Hook 事件: ${event.hook_event_name}`);
+      if (this.botWs && this.botWs.readyState === WebSocket.OPEN) {
+        this.botWs.send(JSON.stringify({ type: 'hook', event }));
+      }
       if (this.deps.onHookEvent) {
         this.deps.onHookEvent(event);
       }
@@ -110,11 +132,13 @@ export class WebServer {
       logger.info(this.tag, `WebSocket 连接: ${ip} (当前: ${this.clients.size + 1})`);
       this.clients.add(ws);
 
-      // Web 输入 → PTY（可选）
+      // Web 输入 → 远程 bot 或本地 PTY
       ws.on('message', (msg: Buffer) => {
         const data = msg.toString();
         logger.info(this.tag, `Web 输入: ${JSON.stringify(data.slice(0, 50))}`);
-        if (this.deps.ptyWrite) {
+        if (this.botWs && this.botWs.readyState === WebSocket.OPEN) {
+          this.botWs.send(JSON.stringify({ type: 'web-input', data }));
+        } else if (this.deps.ptyWrite) {
           this.deps.ptyWrite(data);
         }
       });
@@ -122,6 +146,35 @@ export class WebServer {
       ws.on('close', () => {
         this.clients.delete(ws);
         logger.info(this.tag, `WebSocket 断开: ${ip} (剩余: ${this.clients.size})`);
+      });
+    });
+  }
+
+  /** 处理 sbot bot 提供者 WebSocket 连接 */
+  private setupBotWebSocket(): void {
+    this.botWss.on('connection', (ws) => {
+      logger.info(this.tag, 'Bot 提供者已连接');
+      this.botWs = ws;
+
+      ws.on('message', (msg: Buffer) => {
+        try {
+          const parsed = JSON.parse(msg.toString());
+          if (parsed.type === 'pty-data' && typeof parsed.data === 'string') {
+            // 广播到所有浏览器客户端
+            for (const client of this.clients) {
+              if (client.readyState === WebSocket.OPEN) {
+                client.send(parsed.data);
+              }
+            }
+          }
+        } catch {
+          // 非 JSON 消息忽略
+        }
+      });
+
+      ws.on('close', () => {
+        this.botWs = null;
+        logger.info(this.tag, 'Bot 提供者已断开');
       });
     });
   }
@@ -161,10 +214,15 @@ export class WebServer {
   getPort(): number { return this.port; }
 
   stop(): void {
+    if (this.botWs) {
+      this.botWs.close();
+      this.botWs = null;
+    }
     for (const client of this.clients) {
       client.close();
     }
     this.clients.clear();
+    this.botWss.close();
     this.server.close();
     this.wss.close();
     logger.info(this.tag, 'Web 终端已停止');

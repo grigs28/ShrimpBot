@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as readline from 'readline';
 import * as lark from '@larksuiteoapi/node-sdk';
+import { WebSocket as WS } from 'ws';
 import { PTYManager } from './pty-manager.js';
 import { WebServer } from './web-server.js';
 import { logger } from '../logger.js';
@@ -60,6 +61,9 @@ export class FeishuBridge {
   private sendLock = false;
   private lastSendTime = 0;
   private readonly SEND_INTERVAL_MS = 2500; // 两次发送最小间隔（飞书：5条/10秒/会话）
+
+  /** 远程 WebServer 连接（端口被占时通过 WebSocket 连接） */
+  private remoteWebWs: WS | null = null;
 
   private responseChatId = '';
   private defaultChatId = '';
@@ -134,7 +138,14 @@ export class FeishuBridge {
         logger.info(this.tag, `Hook API 已启动: http://localhost:${webPort}/api/hook`);
       }
     } else {
-      logger.warn(this.tag, `端口 ${webPort} 已被占用，Hook API 和 Web 终端均未启动`);
+      // 端口被占 → 连接到已有 WebServer 作为 bot 提供者
+      logger.info(this.tag, `端口 ${webPort} 已被占用，连接到已有 WebServer`);
+      try {
+        await this.connectToRemoteWebServer(webPort);
+        logger.info(this.tag, `已连接 WebServer，Hook API 代理: http://localhost:${webPort}/api/hook`);
+      } catch (err: any) {
+        logger.warn(this.tag, `无法连接 WebServer: ${err.message}，Web/Hook 不可用`);
+      }
     }
 
     const dispatcher = new lark.EventDispatcher({});
@@ -703,6 +714,60 @@ export class FeishuBridge {
     } catch { return content; }
   }
 
+  /** 连接到远程 WebServer 作为 bot 提供者（PTY 数据推送 + Web 输入接收 + Hook 事件接收） */
+  private connectToRemoteWebServer(port: number): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const ws = new WS(`ws://127.0.0.1:${port}/ws/bot`);
+      let settled = false;
+
+      ws.on('open', () => {
+        // 标识自己
+        ws.send(JSON.stringify({ type: 'bot-join', name: this.config.botName || 'ShrimpBot' }));
+
+        // PTY 数据 → 远程 WebServer → 浏览器
+        this.pty.onRawData((data: string) => {
+          if (ws.readyState === WS.OPEN) {
+            ws.send(JSON.stringify({ type: 'pty-data', data }));
+          }
+        });
+
+        if (!settled) { settled = true; resolve(); }
+      });
+
+      ws.on('message', (msg: Buffer) => {
+        try {
+          const parsed = JSON.parse(msg.toString());
+          if (parsed.type === 'web-input' && typeof parsed.data === 'string') {
+            // Web 输入 → PTY
+            if (!this.firstMessageReceived && /[^\x00-\x1f\x7f]/.test(parsed.data)) {
+              this.firstMessageReceived = true;
+              logger.info(this.tag, 'Web 输入触发，开始转发 Claude 输出');
+            }
+            this.pty.writeRaw(parsed.data);
+          } else if (parsed.type === 'hook' && parsed.event) {
+            // Hook 事件 → 本地处理
+            this.handleHookEvent(parsed.event as HookEvent);
+          }
+        } catch { /* ignore */ }
+      });
+
+      ws.on('error', (err) => {
+        if (!settled) { settled = true; reject(err); }
+      });
+
+      ws.on('close', () => {
+        this.remoteWebWs = null;
+        logger.warn(this.tag, '与 WebServer 的连接已断开');
+      });
+
+      this.remoteWebWs = ws;
+
+      setTimeout(() => {
+        if (!settled) { settled = true; reject(new Error('连接超时')); }
+      }, 5000);
+    });
+  }
+
   stop(): void {
     if (this.sendTimer) { clearTimeout(this.sendTimer); this.sendTimer = null; }
     if (this.optionTimer) { clearTimeout(this.optionTimer); this.optionTimer = null; }
@@ -711,6 +776,7 @@ export class FeishuBridge {
     this.waitingForAnswer = false;
     this.messageQueue = [];
     this.claudeBusy = false;
+    if (this.remoteWebWs) { this.remoteWebWs.close(); this.remoteWebWs = null; }
     this.webServer.stop();
     this.pty.stop();
     if (this.passthrough) {
