@@ -80,10 +80,13 @@ export class OutputParser {
   }
 
   private parseLine(line: string): ParsedOutput | null {
-    // ● 完成标记优先
+    // ● 完成标记：行首 ● 后面跟足够长的文本（>10字符或有中文）
     if (line.startsWith(DONE_MARKER)) {
       const text = this.cleanText(line.slice(1).trim());
-      if (!text) return null;
+      // 太短或匹配 TUI 元素 → 不是真正的完成
+      if (!text || text.length < 10) return null;
+      if (/^(high|medium|low)\b/i.test(text)) return null;
+      if (/\b\/effort\b/i.test(text)) return null;
       this.lastCompleteText = text;
       this.responseLines = [];
       this.accumulatedText = '';
@@ -123,16 +126,6 @@ export class OutputParser {
       this.responseLines.push(text);
     }
     this.accumulatedText = this.responseLines.join('\n');
-
-    if (text.includes(DONE_MARKER)) {
-      const full = this.accumulatedText.replace(/●/g, '').trim();
-      if (full) {
-        this.lastCompleteText = full;
-        this.responseLines = [];
-        this.accumulatedText = '';
-        return { type: 'response', text: full, isComplete: true };
-      }
-    }
 
     return { type: 'response', text: this.accumulatedText, isComplete: false };
   }

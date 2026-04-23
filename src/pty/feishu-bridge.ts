@@ -1,11 +1,11 @@
 import * as fs from 'fs';
-import * as path from 'path';
 import * as readline from 'readline';
 import * as lark from '@larksuiteoapi/node-sdk';
 import { PTYManager } from './pty-manager.js';
 import { WebServer } from './web-server.js';
 import { logger } from '../logger.js';
-import type { FeishuEvent } from '../types/index.js';
+import { addChatId, loadShrimpBotConfig } from '../config.js';
+import type { FeishuEvent, HookEvent } from '../types/index.js';
 
 export interface BridgeConfig {
   feishuAppId: string;
@@ -45,9 +45,6 @@ export class FeishuBridge {
 
   private passthrough = false;
   private streamBuffer = '';
-  /** 按会话记录已发送的累积文本（用于增量对比） */
-  private lastSentTextMap = new Map<string, string>();
-
   /** 是否已收到第一条飞书消息（启动前的 PTY 输出不发送到飞书） */
   private firstMessageReceived = false;
 
@@ -57,8 +54,12 @@ export class FeishuBridge {
   private messageQueue: Array<{ event: FeishuEvent; text: string }> = [];
   private claudeBusy = false;
   private busyTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** 飞书发送队列：串行化所有发送，确保限频 */
+  private sendQueue: Array<{ chatId: string; text: string; rich: boolean; label: string }> = [];
+  private sendLock = false;
   private lastSendTime = 0;
-  private readonly SEND_INTERVAL_MS = 5000; // 飞书发送最小间隔，防止限频
+  private readonly SEND_INTERVAL_MS = 2500; // 两次发送最小间隔（飞书：5条/10秒/会话）
 
   private responseChatId = '';
   private defaultChatId = '';
@@ -93,8 +94,8 @@ export class FeishuBridge {
     this.webServer = new WebServer({
       onPtyData: (cb) => { this.pty.onRawData(cb); },
       ptyWrite: (data) => {
-        // Web/API 输入也标记活跃（让 Claude 回复能转发到飞书）
-        if (!this.firstMessageReceived) {
+        // Web/API 真正文本输入才触发飞书转发（排除终端探针等控制序列）
+        if (!this.firstMessageReceived && /[^\x00-\x1f\x7f]/.test(data)) {
           this.firstMessageReceived = true;
           logger.info(this.tag, 'Web/API 输入触发，开始转发 Claude 输出');
         }
@@ -103,6 +104,7 @@ export class FeishuBridge {
       getBufferText: () => this.pty.getBufferText(),
       getTerminalSize: () => this.pty.getTerminalSize(),
       botName: config.botName,
+      onHookEvent: (event) => this.handleHookEvent(event),
     }, config.webPort || 5554);
 
     this.pty.onEvent((event) => {
@@ -121,16 +123,18 @@ export class FeishuBridge {
   async start(): Promise<void> {
     this.pty.start();
 
-    // Web 终端（仅显式启用时启动）
-    if (this.config.webEnabled) {
-      const webPort = this.config.webPort || 5554;
-      const portAvailable = await WebServer.isPortAvailable(webPort);
-      if (portAvailable) {
-        this.webServer.start();
-        logger.info(this.tag, `Web 终端端口 ${webPort} 可用，已启动`);
+    // 始终启动 Web 服务（hook API + 可选的终端 UI）
+    const webPort = this.config.webPort || 5554;
+    const portAvailable = await WebServer.isPortAvailable(webPort);
+    if (portAvailable) {
+      this.webServer.start();
+      if (this.config.webEnabled) {
+        logger.info(this.tag, `Web 终端已启动: http://localhost:${webPort}`);
       } else {
-        logger.warn(this.tag, `Web 终端端口 ${webPort} 已被占用，跳过 Web 终端`);
+        logger.info(this.tag, `Hook API 已启动: http://localhost:${webPort}/api/hook`);
       }
+    } else {
+      logger.warn(this.tag, `端口 ${webPort} 已被占用，Hook API 和 Web 终端均未启动`);
     }
 
     const dispatcher = new lark.EventDispatcher({});
@@ -183,7 +187,8 @@ export class FeishuBridge {
     process.stdin.on('data', (data: Buffer) => {
       const input = data.toString();
       if (input === '\x03' || input === '\x04') { this.stop(); process.exit(0); }
-      if (!this.firstMessageReceived) {
+      // 只有真正文本输入（非转义序列、非纯控制字符）才触发飞书转发
+      if (!this.firstMessageReceived && /[^\x00-\x1f\x7f]/.test(input)) {
         this.firstMessageReceived = true;
         logger.info(this.tag, '终端输入触发，开始转发 Claude 输出');
       }
@@ -247,7 +252,7 @@ export class FeishuBridge {
     if (this.claudeBusy) {
       logger.info(this.tag, `[${chatLabel}] 排队: "${text.slice(0, 50)}" (队列: ${this.messageQueue.length + 1})`);
       this.messageQueue.push({ event, text });
-      this.sendRawText(event.chatId, `⏳ 排队中（前面还有 ${this.messageQueue.length} 条消息）`);
+      this.enqueueSend(event.chatId, `⏳ 排队中（前面还有 ${this.messageQueue.length} 条消息）`, false, '排队通知');
       return;
     }
 
@@ -275,8 +280,6 @@ export class FeishuBridge {
     this.pendingOptions = [];
     if (this.optionTimer) clearTimeout(this.optionTimer);
     this.claudeBusy = true;
-    // 新一轮：重置增量发送状态
-    this.lastSentTextMap.delete(event.chatId);
     this.sendToPty(text);
 
     // 安全超时：120 秒无完成响应则强制解除阻塞
@@ -327,18 +330,12 @@ export class FeishuBridge {
     }
 
     if (!isComplete) {
-      // 流式累积
+      // 流式累积（只记录不发）
       this.streamBuffer = text;
-      // 每 5 秒增量发送一次（避免飞书限频）
-      if (this.sendTimer) clearTimeout(this.sendTimer);
-      this.sendTimer = setTimeout(() => {
-        this.sendIncremental(targetChatId);
-      }, this.SEND_INTERVAL_MS);
       return;
     }
 
     // === 完整回复 ===
-    if (this.sendTimer) clearTimeout(this.sendTimer);
 
     const hasOptions = this.containsNumberedOptions(text);
 
@@ -346,7 +343,7 @@ export class FeishuBridge {
     if (!hasOptions && this.config.autoApprove !== false && (isYesNo || this.isYesNoQuestion(text))) {
       const isDangerous = FeishuBridge.DANGEROUS_PATTERNS.some(p => p.test(text));
       if (isDangerous) {
-        this.sendRawText(targetChatId, `⚠️ 检测到潜在危险操作，需要手动确认：\n${text}`);
+        this.enqueueSend(targetChatId, `⚠️ 检测到潜在危险操作，需要手动确认：\n${text}`, true, '危险操作警告');
         this.waitingForAnswer = true;
         if (!this.passthrough) {
           fs.writeSync(2, `\x1b[31m⚠️ 危险操作！请手动确认（飞书或终端输入 yes/no）：\n${text}\x1b[0m\n`);
@@ -356,23 +353,28 @@ export class FeishuBridge {
       }
 
       const approveMsg = `[自动通过] ${text}\n→ 已自动回复 yes`;
-      this.sendRawText(targetChatId, approveMsg);
+      this.enqueueSend(targetChatId, approveMsg, true, '自动通过');
       if (!this.passthrough) {
         fs.writeSync(2, `\x1b[36m${approveMsg}\x1b[0m\n`);
       }
       setTimeout(() => { if (this.pty.isRunning()) this.pty.send('yes'); }, 500);
       this.streamBuffer = '';
-      this.lastSentTextMap.delete(targetChatId);
       this.processQueue();
       return;
     }
 
-    // 完成时：只发增量剩余部分（不发完整文本，避免重复）
-    this.sendIncremental(targetChatId);
+    // 完成时：用 streamBuffer（累积的完整内容）而非 text（可能只是 ● 行）
+    const fullText = this.streamBuffer || text;
     this.streamBuffer = '';
-    this.lastSentTextMap.delete(targetChatId);
 
-    // 检查选项
+    // 发送完整回复（clone 和非 clone 都发，确保可靠性）
+    // 非 clone 模式清洗 TUI 表格等，clone 模式原样发送
+    if (fullText.trim()) {
+      const sendText = this.config.clone ? fullText : this.cleanForMarkdown(fullText);
+      this.enqueueSend(targetChatId, sendText, true, `完成: ${sendText.length}字`);
+    }
+
+    // 检查选项（clone 和非 clone 都需要）
     if (this.looksLikeQuestion(text)) {
       this.pendingOptions = [];
       if (this.optionTimer) clearTimeout(this.optionTimer);
@@ -405,7 +407,7 @@ export class FeishuBridge {
     const optionText = options.map((opt, i) => `${i + 1}. ${opt}`).join('\n');
     const message = `📋 请回复编号选择：\n${optionText}`;
 
-    this.sendRawText(targetChatId, message);
+    this.enqueueSend(targetChatId, message, false, '选项列表');
     if (!this.passthrough) {
       const terminal = ['', '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
         '📋 Claude 提问，请回复编号（飞书或终端均可）：', optionText,
@@ -417,91 +419,89 @@ export class FeishuBridge {
   // ========== 发送工具方法 ==========
 
   /**
-   * 增量发送：和上次对比只发新增部分
+   * 入队发送（所有飞书发送必须经过此方法，确保串行化+限频）
    */
-  private async sendIncremental(chatId: string): Promise<void> {
-    const current = this.streamBuffer;
-    if (!current.trim()) return;
-
-    const lastSent = this.lastSentTextMap.get(chatId) || '';
-    if (current === lastSent) return;
-
-    let diff: string;
-    if (lastSent && current.startsWith(lastSent)) {
-      diff = current.substring(lastSent.length);
-    } else {
-      diff = current;
-    }
-
-    if (!diff.trim()) return;
-
-    // 更新已发送记录
-    this.lastSentTextMap.set(chatId, current);
-
-    // 发送到飞书
-    if (this.config.clone) {
-      await this.sendPostMd(chatId, diff);
-    } else {
-      await this.sendRawText(chatId, diff);
-    }
-
-    logger.info(this.tag, `飞书 ← 增量 (${chatId}): +${diff.length}字 "${diff.slice(0, 60)}"`);
+  private enqueueSend(chatId: string, text: string, rich: boolean, label: string): void {
+    this.sendQueue.push({ chatId, text, rich, label });
+    logger.info(this.tag, `飞书 ← 入队 (${chatId}): ${label}`);
+    this.drainSendQueue();
   }
 
-  /** 发送纯文本（带限频保护） */
-  private async sendRawText(chatId: string, text: string): Promise<void> {
-    try {
-      // 限频：两次发送至少间隔 1 秒
+  /**
+   * 串行消费发送队列，每次发送间隔 SEND_INTERVAL_MS
+   */
+  private async drainSendQueue(): Promise<void> {
+    if (this.sendLock) return;
+    this.sendLock = true;
+
+    while (this.sendQueue.length > 0) {
+      const item = this.sendQueue.shift()!;
+
+      // 限频等待
       const now = Date.now();
       const elapsed = now - this.lastSendTime;
-      if (elapsed < 1000) {
-        await new Promise(r => setTimeout(r, 1000 - elapsed));
+      if (elapsed < this.SEND_INTERVAL_MS) {
+        await new Promise(r => setTimeout(r, this.SEND_INTERVAL_MS - elapsed));
       }
       this.lastSendTime = Date.now();
 
-      await this.feishuService.im.v1.message.create({
-        data: {
-          receive_id: chatId,
-          msg_type: 'text',
-          content: JSON.stringify({ text: text.slice(0, 4000) }),
-        },
-        params: { receive_id_type: 'chat_id' },
-      });
-    } catch (err: any) {
-      // 限频错误静默，其他错误记录
-      const msg = err?.response?.data?.msg || String(err);
-      if (msg.includes('rate limit')) {
-        logger.warn(this.tag, `飞书限频，跳过发送`);
-      } else {
-        logger.error(this.tag, `发送飞书失败: ${err}`);
+      try {
+        if (item.rich) {
+          await this.doSendPostMd(item.chatId, item.text);
+        } else {
+          await this.doSendRawText(item.chatId, item.text);
+        }
+        logger.info(this.tag, `飞书 ← 已发送 (${item.chatId}): ${item.label}`);
+      } catch (err: any) {
+        const msg = err?.response?.data?.msg || String(err);
+        if (msg.includes('rate limit') || msg.includes('230020')) {
+          logger.warn(this.tag, `飞书限频，等待 5 秒后重试`);
+          await new Promise(r => setTimeout(r, 5000));
+          // 重试一次
+          try {
+            if (item.rich) {
+              await this.doSendPostMd(item.chatId, item.text);
+            } else {
+              await this.doSendRawText(item.chatId, item.text);
+            }
+          } catch (_) { /* 放弃 */ }
+        } else {
+          logger.error(this.tag, `发送飞书失败: ${err}`);
+        }
       }
     }
+
+    this.sendLock = false;
   }
 
-  /** 发送 post+md 富文本 */
-  private async sendPostMd(chatId: string, text: string): Promise<void> {
+  /** 实际发送纯文本（无限频逻辑，由 drainSendQueue 控制） */
+  private async doSendRawText(chatId: string, text: string): Promise<void> {
+    await this.feishuService.im.v1.message.create({
+      data: {
+        receive_id: chatId,
+        msg_type: 'text',
+        content: JSON.stringify({ text: text.slice(0, 4000) }),
+      },
+      params: { receive_id_type: 'chat_id' },
+    });
+  }
+
+  /** 实际发送 post+md 富文本 */
+  private async doSendPostMd(chatId: string, text: string): Promise<void> {
     const maxBytes = 30 * 1024;
     const encoder = new TextEncoder();
 
     if (encoder.encode(text).length > maxBytes) {
       for (const chunk of this.splitText(text, maxBytes)) {
-        await this.sendPostMdSingle(chatId, chunk);
+        await this.doSendPostMdSingle(chatId, chunk);
       }
     } else {
-      await this.sendPostMdSingle(chatId, text);
+      await this.doSendPostMdSingle(chatId, text);
     }
   }
 
-  private async sendPostMdSingle(chatId: string, text: string): Promise<void> {
+  private async doSendPostMdSingle(chatId: string, text: string): Promise<void> {
     try {
-      // 限频
-      const now = Date.now();
-      const elapsed = now - this.lastSendTime;
-      if (elapsed < 1000) {
-        await new Promise(r => setTimeout(r, 1000 - elapsed));
-      }
-      this.lastSendTime = Date.now();
-
       await this.feishuService.im.v1.message.create({
         data: {
           receive_id: chatId,
@@ -513,10 +513,10 @@ export class FeishuBridge {
     } catch (err: any) {
       const msg = err?.response?.data?.msg || String(err);
       if (msg.includes('rate limit')) {
-        logger.warn(this.tag, `飞书限频，跳过 post 发送`);
+        throw err; // 让 drainSendQueue 处理
       } else {
         logger.error(this.tag, `飞书 post 失败，降级 text: ${err}`);
-        await this.sendRawText(chatId, text);
+        await this.doSendRawText(chatId, text);
       }
     }
   }
@@ -535,6 +535,119 @@ export class FeishuBridge {
     }
     if (current) chunks.push(current);
     return chunks;
+  }
+
+  // ========== Hook 事件处理 ==========
+
+  private handleHookEvent(event: HookEvent): void {
+    if (!this.firstMessageReceived) return;
+    const targetChatId = this.responseChatId || this.defaultChatId;
+    if (!targetChatId) return;
+
+    logger.info(this.tag, `Hook: ${event.hook_event_name}`);
+
+    switch (event.hook_event_name) {
+      case 'Stop': {
+        if (event.stop_hook_active) return; // 防止循环
+        // PTY 已经发送了完整回复，这里只触发 processQueue
+        this.processQueue();
+        break;
+      }
+      case 'Notification': {
+        const msg = event.message || event.title || '';
+        if (msg) {
+          this.enqueueSend(targetChatId, `📢 ${msg}`, true, '通知');
+        }
+        break;
+      }
+      case 'PostToolUseFailure': {
+        const toolName = event.tool_name || 'unknown';
+        const error = event.error || '未知错误';
+        this.enqueueSend(targetChatId, `❌ 工具失败 **${toolName}**: ${error}`, true, '工具失败');
+        break;
+      }
+    }
+  }
+
+  private extractLastAssistantMessage(messages?: Array<{ role: string; content: string | Array<Record<string, unknown>> }>): string {
+    if (!messages || messages.length === 0) return '';
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i]!;
+      if (msg.role === 'assistant') {
+        const { content } = msg;
+        if (typeof content === 'string') {
+          return content.slice(0, 4000);
+        }
+        if (Array.isArray(content)) {
+          return content
+            .filter((b: Record<string, unknown>) => b.type === 'text')
+            .map((b: Record<string, unknown>) => (b as { text: string }).text)
+            .join('\n')
+            .slice(0, 4000);
+        }
+      }
+    }
+    return '';
+  }
+
+  // ========== 文本清洗（非 clone 模式） ==========
+
+  /** 清洗 TUI 表格等，转换为 Markdown 友好格式 */
+  private cleanForMarkdown(text: string): string {
+    const lines = text.split('\n');
+    const result: string[] = [];
+    let inTable = false;
+    let tableRows: string[] = [];
+
+    for (const line of lines) {
+      const t = line.trim();
+
+      // 纯边框行（┌───┬───┐ 等）
+      if (/^[╭╮╰╯┌┐└┘├┤┬┴┼─━═│┃]+$/.test(t)) {
+        if (!inTable && tableRows.length > 0) {
+          // 表格开始，标记
+          inTable = true;
+        }
+        continue; // 跳过所有纯边框行
+      }
+
+      // 表格内容行（含 │ 分隔）→ 收集并转为 markdown 表格
+      if (/^│.*│$/.test(t) || /^[|].*[|]$/.test(t)) {
+        // 提取单元格
+        const cells = t.split(/[│|]/).map(c => c.trim()).filter(Boolean);
+        if (cells.length >= 2) {
+          tableRows.push('| ' + cells.join(' | ') + ' |');
+          inTable = true;
+          continue;
+        }
+      }
+
+      // 非表格行：先把收集的表格输出
+      if (inTable && tableRows.length > 0) {
+        // 第一行后加分隔线
+        if (tableRows.length >= 1) {
+          const cols = tableRows[0]!.split('|').filter(Boolean).length;
+          tableRows.splice(1, 0, '| ' + Array(cols).fill('---').join(' | ') + ' |');
+        }
+        result.push(...tableRows);
+        result.push(''); // 表格后空行
+        tableRows = [];
+        inTable = false;
+      }
+
+      result.push(line);
+    }
+
+    // 末尾残余表格
+    if (tableRows.length > 0) {
+      if (tableRows.length >= 1) {
+        const cols = tableRows[0]!.split('|').filter(Boolean).length;
+        tableRows.splice(1, 0, '| ' + Array(cols).fill('---').join(' | ') + ' |');
+      }
+      result.push(...tableRows);
+    }
+
+    return result.join('\n');
   }
 
   // ========== 检测方法 ==========
@@ -566,25 +679,15 @@ export class FeishuBridge {
   // ========== 持久化 ==========
 
   private saveChatId(chatId: string): void {
-    const envPath = path.join(process.cwd(), '.env');
     const existing = this.config.chatIds || [];
     if (existing.includes(chatId)) return;
 
+    // 更新内存配置
     const newChatIds = [...existing, chatId];
     this.config.chatIds = newChatIds;
 
-    let envContent = '';
-    if (fs.existsSync(envPath)) envContent = fs.readFileSync(envPath, 'utf-8');
-
-    const chatIdsValue = newChatIds.join(',');
-    const chatIdsLine = `FEISHU_CHAT_IDS=${chatIdsValue}`;
-
-    if (/^FEISHU_CHAT_IDS=/m.test(envContent)) {
-      envContent = envContent.replace(/^FEISHU_CHAT_IDS=.*$/m, chatIdsLine);
-    } else {
-      envContent = envContent.trimEnd() + '\n' + chatIdsLine + '\n';
-    }
-    fs.writeFileSync(envPath, envContent);
+    // 写入 ~/.shrimpbot/config.json（不写 .env）
+    addChatId(chatId);
 
     const info = this.knownChats.get(chatId);
     const label = info?.chatType === 'p2p' ? '私聊' : '群聊';

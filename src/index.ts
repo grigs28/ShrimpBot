@@ -5,12 +5,13 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { MCPServer } from './server.js';
-import { loadMultiBotConfig, loadSingleBotConfig } from './config.js';
+import { loadMultiBotConfig, loadSingleBotConfig, saveShrimpBotConfig } from './config.js';
 import { Master } from './master.js';
 import { startBot } from './bot.js';
 import { FeishuBridge } from './pty/feishu-bridge.js';
 import { PTYManager } from './pty/pty-manager.js';
 import { WebServer } from './pty/web-server.js';
+import { ensureHookSettings } from './pty/hook-settings.js';
 import { setupWizard } from './setup.js';
 import { logger } from './logger.js';
 import type { Config } from './types/index.js';
@@ -152,14 +153,14 @@ if (cliArgs.chatId) process.env.FEISHU_CHAT_IDS = cliArgs.chatId;
 const claudeExtraArgs = cliArgs.claudeArgs;
 
 /**
- * 从当前目录加载 .env 文件到 process.env
- * 不覆盖已有环境变量
+ * 从当前目录加载项目配置文件（.sbot）到 process.env
+ * 不覆盖已有环境变量（命令行/全局配置优先）
  */
-function loadEnvFile(): void {
-  const envPath = path.join(process.cwd(), '.env');
-  if (!fs.existsSync(envPath)) return;
+function loadProjectConfig(): void {
+  const configPath = path.join(process.cwd(), '.sbot');
+  if (!fs.existsSync(configPath)) return;
 
-  const content = fs.readFileSync(envPath, 'utf-8');
+  const content = fs.readFileSync(configPath, 'utf-8');
   for (const line of content.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith('#')) continue;
@@ -174,8 +175,8 @@ function loadEnvFile(): void {
   }
 }
 
-// 尽早加载 .env
-loadEnvFile();
+// 尽早加载项目级配置（.sbot）
+loadProjectConfig();
 
 function getConfig(): Config {
   const single = loadSingleBotConfig();
@@ -207,6 +208,9 @@ async function startWebOnlyMode(): Promise<void> {
     ...(process.env.CLAUDE_EXTRA_ARGS?.split(' ').filter(Boolean) || []),
     ...claudeExtraArgs,
   ];
+
+  // 写入 hook 配置
+  ensureHookSettings(webPort);
 
   const pty = new PTYManager({
     claudePath: process.env.CLAUDE_PATH,
@@ -269,9 +273,23 @@ async function startWebOnlyMode(): Promise<void> {
 }
 
 async function startBridgeMode(): Promise<void> {
-  let appId = process.env.FEISHU_APP_ID;
-  let appSecret = process.env.FEISHU_APP_SECRET;
-  let chatIds = (process.env.FEISHU_CHAT_IDS || '').split(',').filter(Boolean);
+  // CLI 参数覆盖
+  let appId = cliArgs.appId || process.env.FEISHU_APP_ID;
+  let appSecret = cliArgs.appSecret || process.env.FEISHU_APP_SECRET;
+  let chatIds = cliArgs.chatId
+    ? [cliArgs.chatId]
+    : (process.env.FEISHU_CHAT_IDS || '').split(',').filter(Boolean);
+
+  // 无凭证 → 从 config.json + bots.json 加载
+  let botName = process.env.FEISHU_BOT_NAME;
+  if (!appId || !appSecret || !botName) {
+    const botConfig = loadSingleBotConfig();
+    if (!appId) appId = botConfig.appId;
+    if (!appSecret) appSecret = botConfig.appSecret;
+    if (chatIds.length === 0) chatIds = botConfig.chatIds;
+    if (!botName) botName = botConfig.name;
+  }
+
   const allowedUsers = (process.env.FEISHU_ALLOWED_USERS || '').split(',').filter(Boolean);
 
   // 没有飞书凭证
@@ -296,10 +314,14 @@ async function startBridgeMode(): Promise<void> {
     ...claudeExtraArgs,
   ];
 
+  // 写入 hook 配置到 .claude/settings.local.json
+  const webPort = parseInt(process.env.WEB_PORT || '5554', 10);
+  ensureHookSettings(webPort);
+
   const bridge = new FeishuBridge({
     feishuAppId: appId,
     feishuAppSecret: appSecret,
-    botName: process.env.FEISHU_BOT_NAME,
+    botName,
     chatIds,
     allowedUsers,
     claudePath: process.env.CLAUDE_PATH,
@@ -333,73 +355,54 @@ async function startBridgeMode(): Promise<void> {
   });
 }
 
+/** 保存活跃 bot 到 ~/.shrimpbot/config.json */
+function saveActiveBot(botName: string, chatIds: string[]): void {
+  saveShrimpBotConfig({
+    activeBotName: botName,
+    chatIds,
+    claudeCwd: process.cwd(),
+  });
+  console.log(`✅ 已切换到 "${botName}"，配置写入 ~/.shrimpbot/config.json`);
+}
+
 /**
- * sbot init：初始化配置
+ * sbot init：初始化/切换配置
  * 支持 --app-id / --app-secret / --name 参数（非交互式）
- * 或无参数时进入交互式向导
+ * 或无参数时进入交互式向导（选择已有 bot 或添加新的）
  */
 async function handleInit(): Promise<void> {
-  console.log('🦐 ShrimpBot — 初始化配置\n');
+  // 有完整参数 → 非交互式，直接写 bots.json + config.json
+  if (cliArgs.appId && cliArgs.appSecret) {
+    const name = cliArgs.name || 'ShrimpBot';
+    const chatIds = cliArgs.chatId ? [cliArgs.chatId] : [] as string[];
 
-  let appId = cliArgs.appId;
-  let appSecret = cliArgs.appSecret;
-  let name = cliArgs.name || 'ShrimpBot';
-  let chatIds = cliArgs.chatId ? [cliArgs.chatId] : [] as string[];
-
-  // 参数不全 → 交互式向导
-  if (!appId || !appSecret) {
-    const config = await setupWizard();
-    appId = config.feishuAppId;
-    appSecret = config.feishuAppSecret;
-    chatIds = config.chatIds;
-  } else {
-    // 参数完整 → 写入 bots.json（按 app-id 判断新增或更新）
     const botsPath = path.join(os.homedir(), '.shrimpbot', 'bots.json');
     let bots: Array<{ name: string; appId: string; appSecret: string }> = [];
     if (fs.existsSync(botsPath)) {
       try { bots = JSON.parse(fs.readFileSync(botsPath, 'utf-8')); } catch { /* ignore */ }
     }
 
-    const existing = bots.find(b => b.appId === appId);
+    const existing = bots.find(b => b.appId === cliArgs.appId);
     if (existing) {
-      // 已有 → 更新 name 和 appSecret
-      if (appSecret) existing.appSecret = appSecret;
+      if (cliArgs.appSecret) existing.appSecret = cliArgs.appSecret;
       if (cliArgs.name) existing.name = name;
-      console.log(`✅ 已更新 Bot "${existing.name}" (${appId})`);
+      console.log(`✅ 已更新 Bot "${existing.name}" (${cliArgs.appId})`);
     } else {
-      // 没有 → 添加
-      bots.push({ name, appId, appSecret });
-      console.log(`✅ 已添加 Bot "${name}" (${appId})`);
+      bots.push({ name, appId: cliArgs.appId, appSecret: cliArgs.appSecret });
+      console.log(`✅ 已添加 Bot "${name}" (${cliArgs.appId})`);
     }
 
     const dir = path.dirname(botsPath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(botsPath, JSON.stringify(bots, null, 2));
-    console.log(`   保存到 ${botsPath}`);
 
-    // 写 .env
-    const envLines = [
-      'FEISHU_MODE=bridge',
-      `FEISHU_APP_ID=${appId}`,
-      `FEISHU_APP_SECRET=${appSecret}`,
-      `FEISHU_CHAT_IDS=${chatIds.join(',')}`,
-      `FEISHU_BOT_NAME=${name}`,
-    ];
-    const envPath = path.join(process.cwd(), '.env');
-    fs.writeFileSync(envPath, envLines.join('\n') + '\n');
-    console.log(`✅ 已保存配置到 ${envPath}`);
-
-    // 写入环境变量供当前进程使用
-    process.env.FEISHU_APP_ID = appId;
-    process.env.FEISHU_APP_SECRET = appSecret;
-    process.env.FEISHU_CHAT_IDS = chatIds.join(',');
-    process.env.FEISHU_BOT_NAME = name;
+    // 写 config.json（切换活跃 bot，不写 .env）
+    saveActiveBot(name, chatIds);
+    return;
   }
 
-  // init 后直接启动 bridge
-  console.log('\n🚀 配置完成，正在启动 Bridge...\n');
-  process.env.FEISHU_MODE = 'bridge';
-  await startBridgeMode();
+  // 无参数或参数不全 → 交互式向导（选择已有 bot 或添加新的）
+  await setupWizard();
 }
 
 async function main() {

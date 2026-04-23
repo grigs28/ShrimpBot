@@ -1,6 +1,5 @@
 // 端到端测试：PTY + 解析器 提取 Claude 回复
-import { spawn, type IPty } from 'node-pty';
-import stripAnsi from 'strip-ansi';
+import { spawn } from 'node-pty';
 import { OutputParser } from '../output-parser.js';
 
 const pty = spawn('/home/grigs/.local/bin/claude', ['--dangerously-skip-permissions'], {
@@ -15,7 +14,10 @@ let sent = false;
 let gotResponse = false;
 
 pty.onData((data) => {
-  const results = parser.parse(data);
+  // 写入 headless 终端
+  parser.write(data);
+
+  const results = parser.parse('');
   for (const r of results) {
     if (r.type === 'response') {
       console.error(`[RESPONSE isComplete=${r.isComplete}] ${r.text.slice(0, 100)}`);

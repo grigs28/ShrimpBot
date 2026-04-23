@@ -44,7 +44,12 @@ export class PTYManager {
     }
 
     const claudePath = this.options.claudePath || 'claude';
-    const args = ['--dangerously-skip-permissions', ...(this.options.extraArgs || [])];
+    // extraArgs 去重（防止 --dangerously-skip-permissions 重复）
+    const baseArgs = ['--dangerously-skip-permissions'];
+    const extraArgs = (this.options.extraArgs || []).filter(
+      a => !baseArgs.includes(a)
+    );
+    const args = [...baseArgs, ...extraArgs];
 
     const cols = this.options.cols || 120;
     const rows = this.options.rows || 40;

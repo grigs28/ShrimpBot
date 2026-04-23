@@ -5,6 +5,7 @@ import * as path from 'path';
 import * as os from 'os';
 import * as readline from 'readline';
 import * as lark from '@larksuiteoapi/node-sdk';
+import { loadBotsRegistry, saveBotsRegistry, saveShrimpBotConfig, loadShrimpBotConfig } from './config.js';
 import type { BridgeConfig } from './pty/feishu-bridge.js';
 
 interface BotEntry {
@@ -16,18 +17,11 @@ interface BotEntry {
 const BOTS_PATH = path.join(os.homedir(), '.shrimpbot', 'bots.json');
 
 function loadBots(): BotEntry[] {
-  if (!fs.existsSync(BOTS_PATH)) return [];
-  try {
-    return JSON.parse(fs.readFileSync(BOTS_PATH, 'utf-8'));
-  } catch {
-    return [];
-  }
+  return loadBotsRegistry();
 }
 
 function saveBots(bots: BotEntry[]): void {
-  const dir = path.dirname(BOTS_PATH);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(BOTS_PATH, JSON.stringify(bots, null, 2));
+  saveBotsRegistry(bots);
 }
 
 function tryReadFromMcpJson(): BotEntry[] {
@@ -56,7 +50,14 @@ function tryReadFromMcpJson(): BotEntry[] {
 }
 
 function ask(rl: readline.Interface, question: string): Promise<string> {
-  return new Promise(resolve => rl.question(question, resolve));
+  return new Promise(resolve => {
+    rl.question(question, (answer: string) => {
+      resolve(answer);
+    });
+    rl.on('close', () => {
+      resolve('');
+    });
+  });
 }
 
 async function selectBot(rl: readline.Interface): Promise<BotEntry> {
@@ -116,14 +117,15 @@ async function selectChats(
   }
 
   if (chats.length === 0) {
-    const chatId = await ask(rl, '\n  请手动输入 Chat ID：');
-    return [chatId];
+    const chatId = await ask(rl, '\n  Chat ID（留空跳过，启动后自动发现）：');
+    return chatId.trim() ? [chatId.trim()] : [];
   }
 
   console.log('\n📋 飞书会话：');
   chats.forEach((c, i) => console.log(`  ${i + 1}. ${c.name}  (${c.chatId})`));
 
-  const choice = await ask(rl, '\n选择编号（多个用逗号分隔）：');
+  const choice = await ask(rl, '\n选择编号（多个用逗号分隔，留空跳过）：');
+  if (!choice.trim()) return [];
   return choice
     .split(',')
     .map(s => {
@@ -133,18 +135,13 @@ async function selectChats(
     .filter(Boolean) as string[];
 }
 
-function saveEnvFile(bot: BotEntry, chatIds: string[]): void {
-  const lines = [
-    'FEISHU_MODE=bridge',
-    `FEISHU_APP_ID=${bot.appId}`,
-    `FEISHU_APP_SECRET=${bot.appSecret}`,
-    `FEISHU_CHAT_IDS=${chatIds.join(',')}`,
-    `FEISHU_BOT_NAME=${bot.name}`,
-  ];
-
-  const envPath = path.join(process.cwd(), '.env');
-  fs.writeFileSync(envPath, lines.join('\n') + '\n');
-  console.log(`\n✅ 已保存到 ${envPath}`);
+function saveShrimpBotState(bot: BotEntry, chatIds: string[]): void {
+  saveShrimpBotConfig({
+    activeBotName: bot.name,
+    chatIds,
+    claudeCwd: process.cwd(),
+  });
+  console.log(`\n✅ 已保存到 ~/.shrimpbot/config.json`);
 }
 
 /**
@@ -162,8 +159,14 @@ export async function setupWizard(): Promise<BridgeConfig> {
     // 1. 选择机器人
     const bot = await selectBot(rl);
 
-    // 2. 已有 chat ID → 直接用，跳过会话选择
-    const existingChatIds = (process.env.FEISHU_CHAT_IDS || '').split(',').filter(Boolean);
+    // 2. 判断是否切换了 bot → 切换则清空旧 chatIds
+    const prevAppId = process.env.FEISHU_APP_ID || '';
+    const switched = prevAppId && prevAppId !== bot.appId;
+    if (switched) {
+      console.log(`\n🔄 切换 Bot: ${prevAppId} → ${bot.name}`);
+    }
+
+    const existingChatIds = switched ? [] : (process.env.FEISHU_CHAT_IDS || '').split(',').filter(Boolean);
     let chatIds: string[];
 
     if (existingChatIds.length > 0) {
@@ -179,13 +182,12 @@ export async function setupWizard(): Promise<BridgeConfig> {
       chatIds = await selectChats(rl, client);
 
       if (chatIds.length === 0) {
-        console.error('❌ 未选择任何会话');
-        process.exit(1);
+        console.log('ℹ️  未选择会话，启动后自动发现（给 bot 发消息即可注册）');
       }
     }
 
-    // 3. 保存到 .env
-    saveEnvFile(bot, chatIds);
+    // 3. 保存到 ~/.shrimpbot/config.json（不写 .env）
+    saveShrimpBotState(bot, chatIds);
 
     // 4. 写入环境变量（当前进程使用）
     process.env.FEISHU_APP_ID = bot.appId;
@@ -193,7 +195,7 @@ export async function setupWizard(): Promise<BridgeConfig> {
     process.env.FEISHU_CHAT_IDS = chatIds.join(',');
     process.env.FEISHU_BOT_NAME = bot.name;
 
-    console.log('\n🚀 配置完成，正在启动 Bridge...\n');
+    console.log('\n🚀 配置完成，运行 sbot 启动 Bridge');
 
     return {
       feishuAppId: bot.appId,

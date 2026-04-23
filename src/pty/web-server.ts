@@ -4,6 +4,7 @@ import * as path from 'path';
 import express from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
 import { logger } from '../logger.js';
+import type { HookEvent } from '../types/index.js';
 
 export interface WebServerDeps {
   /** PTY 原始数据广播 */
@@ -16,6 +17,8 @@ export interface WebServerDeps {
   getTerminalSize: () => { cols: number; rows: number };
   /** Bot 名称 */
   botName?: string;
+  /** Claude Code Hook 事件回调 */
+  onHookEvent?: (event: HookEvent) => void;
 }
 
 export class WebServer {
@@ -74,6 +77,16 @@ export class WebServer {
         terminal: this.deps.getTerminalSize(),
       });
     });
+
+    // API: Claude Code Hook 事件
+    this.app.post('/api/hook', (req, res) => {
+      const event = req.body as HookEvent;
+      logger.info(this.tag, `Hook 事件: ${event.hook_event_name}`);
+      if (this.deps.onHookEvent) {
+        this.deps.onHookEvent(event);
+      }
+      res.json({ ok: true });
+    });
   }
 
   private setupWebSocket(): void {
@@ -90,12 +103,6 @@ export class WebServer {
       const ip = req.socket.remoteAddress;
       logger.info(this.tag, `WebSocket 连接: ${ip} (当前: ${this.clients.size + 1})`);
       this.clients.add(ws);
-
-      // 发送当前缓冲区内容（让新客户端看到历史）
-      const currentBuffer = this.deps.getBufferText();
-      if (currentBuffer) {
-        ws.send(currentBuffer);
-      }
 
       // Web 输入 → PTY（记录日志）
       ws.on('message', (msg: Buffer) => {

@@ -52,3 +52,24 @@ export interface FeishuEvent {
   messageType: string;
   timestamp: number;
 }
+
+// Claude Code Hook 事件
+export interface HookEvent {
+  hook_event_name: 'Stop' | 'Notification' | 'PostToolUseFailure' | 'PostToolUse' | 'PreToolUse';
+  session_id?: string;
+  cwd?: string;
+  transcript_path?: string;
+  // Stop
+  reason?: string;
+  stop_hook_reason?: string;
+  stop_hook_active?: boolean;
+  transcript_messages?: Array<{ role: string; content: string | Array<Record<string, unknown>> }>;
+  // Notification
+  message?: string;
+  title?: string;
+  // Tool events
+  tool_name?: string;
+  tool_input?: Record<string, unknown>;
+  tool_response?: Record<string, unknown>;
+  error?: string;
+}
