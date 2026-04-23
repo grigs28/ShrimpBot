@@ -424,14 +424,17 @@ export class FeishuBridge {
         this.enqueueSend(targetChatId, fullText, true, `完成: ${fullText.length}字`);
       }
     } else {
-      // 非 clone 模式：❯ 是真正完成信号
-      // 优先从 transcript 读完整内容，PTY buffer 作为兜底
+      // 非 clone 模式：❯ 表示 PTY 层面完成
+      // 不立即 patch，等 2 秒确认没有新 Stop（防止中间 ❯ 提前触发）
+      // 保存 PTY 内容，供最终 patch 使用
+      this.fallbackPtyText = fullText;
+      logger.info(this.tag, `PTY ❯ 完成信号: ${fullText.length}字`);
       if (this.stopHookTimer) clearTimeout(this.stopHookTimer);
-      this.completionHandled = true;
-      // 等 1 秒让 transcript 文件 flush，然后读取
-      setTimeout(() => {
-        this.doFinalPatch(fullText);
-      }, 1000);
+      this.stopHookTimer = setTimeout(() => {
+        if (!this.completionHandled) {
+          this.doFinalPatch(this.fallbackPtyText);
+        }
+      }, 2000);
       return;
     }
 
@@ -918,8 +921,11 @@ export class FeishuBridge {
     return result.join('\n');
   }
 
-  /** 最终 patch：❯ 触发后，优先 transcript，兜底 PTY buffer */
+  /** 最终 patch：从 transcript 读最终内容，PTY buffer 兜底 */
   private doFinalPatch(ptyFallback: string): void {
+    if (this.completionHandled) return;
+    this.completionHandled = true;
+    if (this.stopHookTimer) { clearTimeout(this.stopHookTimer); this.stopHookTimer = null; }
     let content = this.readLastAssistantFromTranscript(this.lastTranscriptPath);
     if (!content.trim()) {
       content = this.cleanForMarkdown(ptyFallback);
