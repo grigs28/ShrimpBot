@@ -49,6 +49,8 @@ export class FeishuBridge {
   private completionHandled = false;
   /** PTY 完成时的兜底内容（Hook Stop 未触发时使用） */
   private fallbackPtyText = '';
+  /** 最后一次 Hook Stop 传入的 transcript_path */
+  private lastTranscriptPath = '';
   /** 是否已收到第一条飞书消息（启动前的 PTY 输出不发送到飞书） */
   private firstMessageReceived = false;
 
@@ -422,23 +424,14 @@ export class FeishuBridge {
         this.enqueueSend(targetChatId, fullText, true, `完成: ${fullText.length}字`);
       }
     } else {
-      // 非 clone 模式：不在这里 patch 卡片！
-      // PTY 解析的内容可能不完整（如表格只有表头），
-      // 等 Hook Stop 从 transcript 拿到完整干净内容再 patch。
-      // 这里只保存 buffer 作为兜底（Hook 没触发时用）。
-      this.completionHandled = false; // 不标记，留给 Hook Stop
-      this.fallbackPtyText = fullText; // 兜底内容
-      logger.info(this.tag, `PTY 完成信号: ${fullText.length}字，等 Hook Stop 处理`);
-      // 5 秒后 Hook Stop 还没来就用 PTY 内容兜底
+      // 非 clone 模式：❯ 是真正完成信号
+      // 优先从 transcript 读完整内容，PTY buffer 作为兜底
       if (this.stopHookTimer) clearTimeout(this.stopHookTimer);
-      this.stopHookTimer = setTimeout(() => {
-        if (!this.completionHandled && this.fallbackPtyText) {
-          logger.info(this.tag, `Hook Stop 超时，用 PTY 内容兜底`);
-          this.completionHandled = true;
-          this.patchCard('green', '🟢 完成', this.cleanForMarkdown(this.fallbackPtyText));
-        }
-        this.processQueue();
-      }, 5000);
+      this.completionHandled = true;
+      // 等 1 秒让 transcript 文件 flush，然后读取
+      setTimeout(() => {
+        this.doFinalPatch(fullText);
+      }, 1000);
       return;
     }
 
@@ -813,22 +806,21 @@ export class FeishuBridge {
     switch (event.hook_event_name) {
       case 'Stop': {
         if (event.stop_hook_active) return; // 防止循环
-        const transcriptPath = event.transcript_path;
+        if (event.transcript_path) this.lastTranscriptPath = event.transcript_path;
         logger.info(this.tag, `Hook Stop: completionHandled=${this.completionHandled}, currentCardId=${!!this.currentCardId}`);
-        // 非 clone 模式：debounce，等 5 秒没有新 Stop 再 patch
+        // 非 clone 模式：debounce 更新进度，不标记完成
+        // 真正完成由 PTY ❯ 信号判定
         if (!this.config.clone && this.currentCardId && !this.completionHandled) {
           if (this.stopHookTimer) clearTimeout(this.stopHookTimer);
           this.stopHookTimer = setTimeout(() => {
             if (this.completionHandled) { this.processQueue(); return; }
-            const content = this.readLastAssistantFromTranscript(transcriptPath);
+            const content = this.readLastAssistantFromTranscript(this.lastTranscriptPath);
             logger.info(this.tag, `Hook Stop (debounced): transcript=${content.length}字, 预览="${content.slice(0, 100)}"`);
             if (content.trim()) {
-              this.completionHandled = true;
-              this.patchCard('green', '🟢 完成', content);
+              this.patchCard('blue', '🔄 处理中', content);
             }
-            this.processQueue();
-          }, 5000);
-          return; // 不 processQueue，等 debounce 结束再处理
+          }, 3000);
+          return;
         }
         this.processQueue();
         break;
@@ -925,6 +917,19 @@ export class FeishuBridge {
     }
 
     return result.join('\n');
+  }
+
+  /** 最终 patch：❯ 触发后，优先 transcript，兜底 PTY buffer */
+  private doFinalPatch(ptyFallback: string): void {
+    let content = this.readLastAssistantFromTranscript(this.lastTranscriptPath);
+    if (!content.trim()) {
+      content = this.cleanForMarkdown(ptyFallback);
+    }
+    logger.info(this.tag, `最终 patch: ${content.length}字 (transcript=${this.lastTranscriptPath ? 'yes' : 'no'})`);
+    if (content.trim()) {
+      this.patchCard('green', '🟢 完成', content);
+    }
+    this.processQueue();
   }
 
   // ========== 检测方法 ==========
