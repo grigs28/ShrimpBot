@@ -156,14 +156,18 @@ if (cliArgs.chatId) process.env.FEISHU_CHAT_IDS = cliArgs.chatId;
 const claudeExtraArgs = cliArgs.claudeArgs;
 
 /**
- * 从当前目录加载项目配置文件（.sbot）到 process.env
+ * 从当前目录加载项目配置文件到 process.env
+ * 优先读 .sbot，回退读 .env（兼容旧项目）
  * 不覆盖已有环境变量（命令行/全局配置优先）
  */
 function loadProjectConfig(): void {
-  const configPath = path.join(process.cwd(), '.sbot');
-  if (!fs.existsSync(configPath)) return;
+  const cwd = process.cwd();
+  const configPath = path.join(cwd, '.sbot');
+  const envPath = path.join(cwd, '.env');
+  const filePath = fs.existsSync(configPath) ? configPath : (fs.existsSync(envPath) ? envPath : null);
+  if (!filePath) return;
 
-  const content = fs.readFileSync(configPath, 'utf-8');
+  const content = fs.readFileSync(filePath, 'utf-8');
   for (const line of content.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith('#')) continue;
