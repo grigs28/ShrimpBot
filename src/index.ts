@@ -19,7 +19,7 @@ import type { Config } from './types/index.js';
 // ========== CLI 参数解析 ==========
 
 // sbot 自己的参数（只解析这些，其余全部透传给 Claude）
-const SBOT_FLAGS = new Set(['--debug', '--clone', '--web', '--web-server', '-h', '--help']);
+const SBOT_FLAGS = new Set(['--debug', '--clone', '--web', '--web-server', '--no-auth', '-h', '--help']);
 const SBOT_OPTIONS = new Set(['--command', '--cwd', '--chat', '--app-id', '--app-secret', '--name']);
 
 interface CliArgs {
@@ -30,6 +30,7 @@ interface CliArgs {
   clone?: boolean;
   web?: boolean;
   webServer?: boolean;
+  noAuth?: boolean;
   appId?: string;
   appSecret?: string;
   name?: string;
@@ -87,6 +88,7 @@ function parseArgs(): CliArgs {
         case '--clone': args.clone = true; break;
         case '--web': args.web = true; break;
         case '--web-server': args.webServer = true; break;
+        case '--no-auth': args.noAuth = true; break;
       }
       i++;
       continue;
@@ -118,6 +120,7 @@ sbot 选项:
   --web                    启用 Web 终端（飞书+终端+Web 三端模式）
                             仅 --web 不带飞书配置时为纯 Web 模式
   --web-server             独立 Web 服务（不启动 PTY/飞书，仅 Web UI + API）
+  --no-auth                禁用 Web 登录认证（开发/内网模式）
   -h, --help               显示帮助
 
 init 选项:
@@ -151,6 +154,7 @@ const cliArgs = parseArgs();
 if (cliArgs.debug) process.env.LOG_LEVEL = 'debug';
 if (cliArgs.cwd) process.env.CLAUDE_CWD = cliArgs.cwd;
 if (cliArgs.chatId) process.env.FEISHU_CHAT_IDS = cliArgs.chatId;
+if (cliArgs.noAuth) process.env.WEB_NO_AUTH = 'true';
 
 // Claude 透传参数（CLI 的优先于环境变量的）
 const claudeExtraArgs = cliArgs.claudeArgs;
@@ -228,6 +232,10 @@ async function startWebOnlyMode(): Promise<void> {
     getBufferText: () => pty.getBufferText(),
     getTerminalSize: () => pty.getTerminalSize(),
     botName: process.env.FEISHU_BOT_NAME || 'ShrimpBot',
+    yzLoginUrl: process.env.YZ_LOGIN_URL,
+    serviceUrl: process.env.SERVICE_URL,
+    sessionSecret: process.env.SESSION_SECRET,
+    noAuth: process.env.WEB_NO_AUTH === 'true',
   }, webPort);
 
   pty.start();
@@ -285,12 +293,17 @@ async function startStandaloneWebServer(): Promise<void> {
     process.exit(1);
   }
 
+  const noAuth = process.env.WEB_NO_AUTH === 'true';
   const webServer = new WebServer({
     botName: 'ShrimpBot Hub',
+    yzLoginUrl: process.env.YZ_LOGIN_URL || 'http://192.168.0.18:5551',
+    serviceUrl: process.env.SERVICE_URL || `http://192.168.0.19:${webPort}`,
+    sessionSecret: process.env.SESSION_SECRET,
+    noAuth,
   }, webPort);
 
   await webServer.start();
-  logger.info('Main', `独立 Web 服务已启动: http://localhost:${webPort}`);
+  logger.info('Main', `独立 Web 服务已启动: http://localhost:${webPort}${noAuth ? ' (无认证模式)' : ''}`);
 
   process.on('SIGINT', () => {
     webServer.stop();
