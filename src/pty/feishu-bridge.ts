@@ -53,6 +53,8 @@ export class FeishuBridge {
   private lastTranscriptPath = '';
   /** 是否已收到第一条飞书消息（启动前的 PTY 输出不发送到飞书） */
   private firstMessageReceived = false;
+  /** 当前轮次是否已发过 Notification（"Claude is waiting" 只发一次） */
+  private notificationSent = false;
 
   /** 最近发给 Claude 的用户消息（用于去重回显） */
   private lastUserMessage = '';
@@ -72,6 +74,8 @@ export class FeishuBridge {
 
   /** Stop Hook 动态等待：PTY 输出停止更新时触发 */
   private stopHookTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 兜底完成 timer：8s 无新 Stop 自动完成 */
+  private completionTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly STOP_HOOK_CHECK_INTERVAL_MS = 1000; // 检查间隔（1秒）
   private readonly STOP_HOOK_MAX_WAIT_MS = 15000; // 最长等待时间（15秒）
   private stopHookWaitStartTime = 0;
@@ -117,6 +121,10 @@ export class FeishuBridge {
         if (!this.firstMessageReceived && /[^\x00-\x1f\x7f]/.test(data)) {
           this.firstMessageReceived = true;
           logger.info(this.tag, 'Web/API 输入触发，开始转发 Claude 输出');
+        }
+        // Web/API Enter 提交命令 → 开始新一轮
+        if (data.includes('\r') && this.completionHandled && this.firstMessageReceived) {
+          this.handleExternalCommand();
         }
         this.pty.writeRaw(data);
       },
@@ -213,10 +221,13 @@ export class FeishuBridge {
     process.stdin.on('data', (data: Buffer) => {
       const input = data.toString();
       if (input === '\x03' || input === '\x04') { this.stop(); process.exit(0); }
-      // 只有真正文本输入（非转义序列、非纯控制字符）才触发飞书转发
       if (!this.firstMessageReceived && /[^\x00-\x1f\x7f]/.test(input)) {
         this.firstMessageReceived = true;
         logger.info(this.tag, '终端输入触发，开始转发 Claude 输出');
+      }
+      // 终端 Enter 提交命令 → 开始新一轮（飞书三端同步）
+      if (input.includes('\r') && this.completionHandled && this.firstMessageReceived) {
+        this.handleExternalCommand();
       }
       this.pty.writeRaw(input);
     });
@@ -300,6 +311,7 @@ export class FeishuBridge {
     this.defaultChatId = event.chatId;
     this.lastUserMessage = text;
     this.completionHandled = false;
+    this.notificationSent = false;
 
     const chatLabel = event.chatType === 'p2p' ? '私聊' : '群聊';
     logger.info(this.tag, `[${chatLabel}] 飞书 → Claude: "${text.slice(0, 100)}" (${event.chatId})`);
@@ -330,6 +342,39 @@ export class FeishuBridge {
    */
   private sendToPty(text: string): void {
     this.pty.send(text);
+  }
+
+  /** 终端/Web 输入提交命令 → 开始新一轮（三端同步） */
+  private handleExternalCommand(): void {
+    const chatId = this.responseChatId || this.defaultChatId;
+    if (!chatId) return;
+
+    // 清理上一轮的 timer
+    if (this.stopHookTimer) { clearTimeout(this.stopHookTimer); this.stopHookTimer = null; }
+
+    // 重置状态
+    this.completionHandled = false;
+    this.notificationSent = false;
+    this.streamBuffer = '';
+    this.fallbackPtyText = '';
+
+    // 非 clone 模式发思考卡片
+    if (!this.config.clone) {
+      this.sendThinkingCard(chatId);
+    }
+
+    this.claudeBusy = true;
+
+    // 安全超时
+    if (this.busyTimer) clearTimeout(this.busyTimer);
+    this.busyTimer = setTimeout(() => {
+      if (this.claudeBusy) {
+        logger.warn(this.tag, '⏰ 外部输入响应超时（120s），强制解除 claudeBusy');
+        this.processQueue();
+      }
+    }, 120_000);
+
+    logger.info(this.tag, `外部输入开始新一轮: chatId=${chatId}`);
   }
 
   private processQueue(): void {
@@ -374,12 +419,11 @@ export class FeishuBridge {
 
     // === 完整回复 ===
 
-    // 防双重 patch：Stop hook 可能已处理过
+    // 防双重 patch：Stop hook 或 doFinalPatch 可能已处理过
     if (this.completionHandled) {
       this.streamBuffer = '';
       return;
     }
-    this.completionHandled = true;
 
     const hasOptions = this.containsNumberedOptions(text);
 
@@ -387,6 +431,7 @@ export class FeishuBridge {
     if (!hasOptions && this.config.autoApprove !== false && (isYesNo || this.isYesNoQuestion(text))) {
       const isDangerous = FeishuBridge.DANGEROUS_PATTERNS.some(p => p.test(text));
       if (isDangerous) {
+        this.completionHandled = true;
         if (this.config.clone) {
           this.enqueueSend(targetChatId, `⚠️ 检测到潜在危险操作，需要手动确认：\n${text}`, true, '危险操作警告');
         } else {
@@ -401,6 +446,7 @@ export class FeishuBridge {
       }
 
       const approveMsg = `[自动通过] ${text}\n→ 已自动回复 yes`;
+      // 自动通过不设 completionHandled，Claude 发 yes 后继续工作，最终 ❯ 才触发 doFinalPatch
       if (this.config.clone) {
         this.enqueueSend(targetChatId, approveMsg, true, '自动通过');
       } else {
@@ -419,26 +465,22 @@ export class FeishuBridge {
     this.streamBuffer = '';
 
     if (this.config.clone) {
-      // clone 模式：发新消息
+      // clone 模式：直接发新消息
+      this.completionHandled = true;
       if (fullText.trim()) {
         this.enqueueSend(targetChatId, fullText, true, `完成: ${fullText.length}字`);
       }
     } else {
-      // 非 clone 模式：❯ 表示 PTY 层面完成
-      // 不立即 patch，等 2 秒确认没有新 Stop（防止中间 ❯ 提前触发）
-      // 保存 PTY 内容，供最终 patch 使用
-      this.fallbackPtyText = fullText;
-      logger.info(this.tag, `PTY ❯ 完成信号: ${fullText.length}字`);
-      if (this.stopHookTimer) clearTimeout(this.stopHookTimer);
-      this.stopHookTimer = setTimeout(() => {
-        if (!this.completionHandled) {
-          this.doFinalPatch(this.fallbackPtyText);
-        }
-      }, 2000);
+      // 非 clone 模式：❯ 仅作加速信号，内容从 transcript 读取
+      logger.info(this.tag, `PTY ❯ → 加速完成 (${fullText.length}字)`);
+      if (!this.completionHandled) {
+        if (this.stopHookTimer) clearTimeout(this.stopHookTimer);
+        this.doFinalPatch();
+      }
       return;
     }
 
-    // 检查选项
+    // clone 模式后续：检查选项
     if (this.looksLikeQuestion(text)) {
       this.pendingOptions = [];
       if (this.optionTimer) clearTimeout(this.optionTimer);
@@ -558,6 +600,27 @@ export class FeishuBridge {
     }
     this.currentCardId = null;
     this.currentCardChatId = null;
+  }
+
+  /** 发送独立的交互式卡片（不影响 currentCardId，不 patch 现有卡片） */
+  private async sendIndependentCard(chatId: string, color: string, title: string, content: string): Promise<void> {
+    const truncated = content.length > 28000
+      ? content.slice(0, 14000) + '\n\n... (内容过长已截断) ...\n\n' + content.slice(-14000)
+      : content;
+    try {
+      await this.feishuService.im.v1.message.create({
+        data: {
+          receive_id: chatId,
+          msg_type: 'interactive',
+          content: JSON.stringify(this.buildCard(color, title, truncated)),
+        },
+        params: { receive_id_type: 'chat_id' },
+      });
+      logger.info(this.tag, `独立卡片已发送: ${title}`);
+    } catch (err) {
+      logger.warn(this.tag, `独立卡片发送失败，降级文本: ${err}`);
+      this.enqueueSend(chatId, `${title}\n${truncated.slice(0, 4000)}`, true, title);
+    }
   }
 
   /** 构建飞书 interactive 卡片 JSON
@@ -816,18 +879,27 @@ export class FeishuBridge {
         if (event.stop_hook_active) return; // 防止循环
         if (event.transcript_path) this.lastTranscriptPath = event.transcript_path;
         logger.info(this.tag, `Hook Stop: completionHandled=${this.completionHandled}, currentCardId=${!!this.currentCardId}`);
-        // 非 clone 模式：debounce 更新进度，不标记完成
-        // 真正完成由 PTY ❯ 信号判定
-        if (!this.config.clone && this.currentCardId && !this.completionHandled) {
+        // 非 clone 模式：Stop 驱动完成卡片
+        if (!this.config.clone && !this.completionHandled) {
+          // 每次 Stop 重置 timer
           if (this.stopHookTimer) clearTimeout(this.stopHookTimer);
           this.stopHookTimer = setTimeout(() => {
             if (this.completionHandled) { this.processQueue(); return; }
             const content = this.readLastAssistantFromTranscript(this.lastTranscriptPath);
-            logger.info(this.tag, `Hook Stop (debounced): transcript=${content.length}字, 预览="${content.slice(0, 100)}"`);
-            if (content.trim()) {
+            logger.info(this.tag, `Hook Stop (debounced): transcript=${content.length}字`);
+            if (content.trim() && this.currentCardId) {
+              // 中间 Stop → 进度更新
               this.patchCard('blue', '🔄 处理中', content, true);
             }
           }, 3000);
+          // 兜底完成：如果 ❯ 一直没来，8s 后自动完成
+          if (this.completionTimer) clearTimeout(this.completionTimer);
+          this.completionTimer = setTimeout(() => {
+            if (!this.completionHandled) {
+              logger.info(this.tag, `Hook Stop 兜底完成 (8s)`);
+              this.doFinalPatch();
+            }
+          }, 8000);
           return;
         }
         this.processQueue();
@@ -835,17 +907,20 @@ export class FeishuBridge {
       }
       case 'Notification': {
         const msg = event.message || event.title || '';
-        if (msg) {
-          // 发独立消息，不 patch 主卡片（避免清掉 currentCardId 影响 Stop 流程）
-          this.enqueueSend(targetChatId, `📢 ${msg}`, true, '通知');
+        if (msg && !this.notificationSent) {
+          this.notificationSent = true;
+          this.sendIndependentCard(targetChatId, 'orange', '📢 通知', msg);
         }
         break;
       }
       case 'PostToolUseFailure': {
         const toolName = event.tool_name || 'unknown';
         const error = event.error || '未知错误';
-        // 发独立消息，不 patch 主卡片
-        this.enqueueSend(targetChatId, `❌ 工具失败 **${toolName}**: ${error}`, true, '工具失败');
+        if (event.transcript_path) this.lastTranscriptPath = event.transcript_path;
+        // 优先从 transcript 读取完整内容
+        let content = this.readLastAssistantFromTranscript(this.lastTranscriptPath);
+        if (!content.trim()) content = error;
+        this.sendIndependentCard(targetChatId, 'red', `❌ 工具失败: ${toolName}`, content);
         break;
       }
     }
@@ -921,15 +996,13 @@ export class FeishuBridge {
     return result.join('\n');
   }
 
-  /** 最终 patch：从 transcript 读最终内容，PTY buffer 兜底 */
-  private doFinalPatch(ptyFallback: string): void {
+  /** 最终 patch：从 transcript 读内容（不使用 PTY buffer） */
+  private doFinalPatch(): void {
     if (this.completionHandled) return;
     this.completionHandled = true;
     if (this.stopHookTimer) { clearTimeout(this.stopHookTimer); this.stopHookTimer = null; }
-    let content = this.readLastAssistantFromTranscript(this.lastTranscriptPath);
-    if (!content.trim()) {
-      content = this.cleanForMarkdown(ptyFallback);
-    }
+    if (this.completionTimer) { clearTimeout(this.completionTimer); this.completionTimer = null; }
+    const content = this.readLastAssistantFromTranscript(this.lastTranscriptPath);
     logger.info(this.tag, `最终 patch: ${content.length}字 (transcript=${this.lastTranscriptPath ? 'yes' : 'no'})`);
     if (content.trim()) {
       this.patchCard('green', '🟢 完成', content);
@@ -1019,6 +1092,9 @@ export class FeishuBridge {
               this.firstMessageReceived = true;
               logger.info(this.tag, 'Web 输入触发，开始转发 Claude 输出');
             }
+            if (parsed.data.includes('\r') && this.completionHandled && this.firstMessageReceived) {
+              this.handleExternalCommand();
+            }
             this.pty.writeRaw(parsed.data);
           } else if (parsed.type === 'hook' && parsed.event) {
             // Hook 事件 → 本地处理
@@ -1049,6 +1125,7 @@ export class FeishuBridge {
     if (this.optionTimer) { clearTimeout(this.optionTimer); this.optionTimer = null; }
     if (this.busyTimer) { clearTimeout(this.busyTimer); this.busyTimer = null; }
     if (this.stopHookTimer) { clearTimeout(this.stopHookTimer); this.stopHookTimer = null; }
+    if (this.completionTimer) { clearTimeout(this.completionTimer); this.completionTimer = null; }
     this.pendingOptions = [];
     this.waitingForAnswer = false;
     this.messageQueue = [];
