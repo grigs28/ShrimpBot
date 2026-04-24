@@ -317,6 +317,9 @@ export class FeishuBridge {
     this.completionHandled = false;
     this.ptyReady = false;
     this.notificationSent = false;
+    this.streamBuffer = '';
+    this.fallbackPtyText = '';
+    this.lastTranscriptPath = '';
 
     const chatLabel = event.chatType === 'p2p' ? '私聊' : '群聊';
     logger.info(this.tag, `[${chatLabel}] 飞书 → Claude: "${text.slice(0, 100)}" (${event.chatId})`);
@@ -363,6 +366,7 @@ export class FeishuBridge {
     this.notificationSent = false;
     this.streamBuffer = '';
     this.fallbackPtyText = '';
+    this.lastTranscriptPath = '';
 
     // 非 clone 模式发思考卡片
     if (!this.config.clone) {
