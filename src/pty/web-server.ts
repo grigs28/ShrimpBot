@@ -8,6 +8,7 @@ import { logger } from '../logger.js';
 import { loadWebSettings, saveWebSettings } from './web-settings.js';
 import { loadBotsRegistry, saveBotsRegistry } from '../config.js';
 import { upsertUser, getUserRole, setUserRole, deleteUser, loadUsers, isAdmin } from './web-users.js';
+import { loadCommands, addCommand, deleteCommand, saveCommands } from './web-commands.js';
 import type { HookEvent } from '../types/index.js';
 
 export interface WebServerDeps {
@@ -110,15 +111,15 @@ export class WebServer {
 
   /** 认证中间件：需要管理员登录 */
   private requireAuth = (req: express.Request, res: express.Response, next: express.NextFunction): void => {
-    if (this.noAuth && !req.session?.user) {
-      // noAuth 模式自动赋予管理员
-      req.session.user = { id: 0, username: 'local', display_name: '本地用户', role: 'admin' };
+    if (this.noAuth) {
+      // noAuth 模式跳过所有认证，直接放行
+      next();
+      return;
     }
     if (!req.session?.user) {
       res.redirect('/login');
       return;
     }
-    // 检查本地角色
     const role = getUserRole(req.session.user.id);
     if (role !== 'admin') {
       res.status(403).send('需要管理员权限');
@@ -129,6 +130,10 @@ export class WebServer {
 
   /** 管理员中间件（已由 requireAuth 保证，这里做双重检查） */
   private requireAdmin = (req: express.Request, res: express.Response, next: express.NextFunction): void => {
+    if (this.noAuth) {
+      next();
+      return;
+    }
     if (!req.session?.user || getUserRole(req.session.user.id) !== 'admin') {
       res.status(403).send('需要管理员权限');
       return;
@@ -258,7 +263,7 @@ export class WebServer {
       res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
       res.setHeader('Pragma', 'no-cache');
       res.setHeader('Expires', '0');
-      const user = _req.session!.user!;
+      const user = _req.session?.user || { id: 0, username: 'local', display_name: '本地用户', role: 'admin' as const };
       res.send(this.getTerminalPage(user));
     });
 
@@ -393,6 +398,69 @@ export class WebServer {
         return;
       }
       res.json({ ok: true });
+    });
+
+    // ===== 命令面板 API =====
+    // 获取某只虾的常用命令
+    this.app.get('/api/commands/:botName', this.requireAuth, (req, res) => {
+      const botName = req.params.botName as string;
+      res.json(loadCommands(botName));
+    });
+
+    // 添加一条命令
+    this.app.post('/api/commands/:botName', this.requireAuth, (req, res) => {
+      const botName = req.params.botName as string;
+      const { label, command } = req.body as { label?: string; command?: string };
+      if (!label || !command) {
+        res.status(400).json({ error: 'label 和 command 必填' });
+        return;
+      }
+      const cmds = addCommand(botName, label, command);
+      res.json(cmds);
+    });
+
+    // 删除一条命令
+    this.app.delete('/api/commands/:botName/:idx', this.requireAuth, (req, res) => {
+      const botName = req.params.botName as string;
+      const idx = req.params.idx as string;
+      const index = parseInt(idx, 10);
+      const cmds = deleteCommand(botName, index);
+      if (cmds === null) {
+        res.status(400).json({ error: '索引无效' });
+        return;
+      }
+      res.json(cmds);
+    });
+
+    // 导出命令（返回 JSON 文件下载）
+    this.app.get('/api/commands/:botName/export', this.requireAuth, (req, res) => {
+      const botName = req.params.botName as string;
+      const cmds = loadCommands(botName);
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Content-Disposition', `attachment; filename="${botName}-commands.json"`);
+      res.send(JSON.stringify(cmds, null, 2));
+    });
+
+    // 导入命令（JSON 上传，合并到现有命令）
+    this.app.post('/api/commands/:botName/import', this.requireAuth, (req, res) => {
+      const botName = req.params.botName as string;
+      const incoming = req.body as Array<{ label: string; command: string }>;
+      if (!Array.isArray(incoming)) {
+        res.status(400).json({ error: '需要 JSON 数组' });
+        return;
+      }
+      const existing = loadCommands(botName);
+      // 合并：跳过 command 重复的
+      const existingCmds = new Set(existing.map(c => c.command));
+      let added = 0;
+      for (const cmd of incoming) {
+        if (cmd.label && cmd.command && !existingCmds.has(cmd.command)) {
+          existing.push({ label: cmd.label, command: cmd.command });
+          added++;
+        }
+      }
+      saveCommands(botName, existing);
+      res.json({ total: existing.length, added });
     });
   }
 
@@ -660,13 +728,99 @@ export class WebServer {
   }
   .tab-bar.show { display: flex; }
   .tab {
-    padding: 8px 16px; font-size: 13px; color: #7f8c8d;
+    padding: 8px 16px; font-size: 14px; font-weight: bold; color: #a0a0a0;
     cursor: pointer; border-bottom: 2px solid transparent;
     transition: all 0.2s; user-select: none;
   }
-  .tab:hover { color: #e0e0e0; }
-  .tab.on { color: #e94560; border-bottom-color: #e94560; }
+  .tab:hover { color: #f0f0f0; }
+  .tab.on { color: #ffd700; border-bottom-color: #ffd700; text-shadow: 0 0 8px rgba(255,215,0,0.5); }
   #terms { flex: 1; padding: 4px; overflow: hidden; position: relative; }
+  /* 命令面板按钮 — 在 footer 内，右对齐 */
+  .foot { position: relative; }
+  #cmdBtn {
+    background: #e94560; color: #fff; border: none;
+    border-radius: 6px; padding: 3px 12px; font-size: 12px; font-weight: bold;
+    cursor: pointer; font-family: inherit; margin-left: auto;
+    box-shadow: 0 0 8px rgba(233,69,96,0.4);
+  }
+  #cmdBtn:hover { background: #ff6b81; }
+  /* 命令面板弹窗 — fixed 定位，浮在右下角 */
+  #cmdPanel {
+    display: none; position: fixed; right: 16px; bottom: 36px; z-index: 9999;
+    width: 320px; max-height: 70vh; background: #16213e;
+    border: 1px solid #0f3460; border-radius: 8px; overflow: hidden;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.5); flex-direction: column;
+  }
+  #cmdPanel.open { display: flex; }
+  #cmdPanel .cp-head {
+    padding: 10px 12px; border-bottom: 1px solid #0f3460;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  #cmdPanel .cp-head span { font-size: 13px; font-weight: bold; color: #e94560; }
+  #cmdPanel .cp-head button {
+    background: none; border: none; color: #7f8c8d; cursor: pointer; font-size: 14px; padding: 0 4px;
+  }
+  #cmdPanel .cp-head button:hover { color: #e0e0e0; }
+  #cmdPanel .cp-body { flex: 1; overflow-y: auto; padding: 6px 0; }
+  #cmdPanel .cp-item {
+    padding: 8px 12px; cursor: pointer; display: flex; align-items: center;
+    justify-content: space-between; transition: background 0.15s;
+  }
+  #cmdPanel .cp-item:hover { background: #1a2a4a; }
+  #cmdPanel .cp-item .cp-label { font-size: 13px; color: #e0e0e0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #cmdPanel .cp-item .cp-del { color: #555; font-size: 12px; padding: 0 4px; cursor: pointer; }
+  #cmdPanel .cp-item .cp-del:hover { color: #e74c3c; }
+  #cmdPanel .cp-item .cp-cb {
+    width: 16px; height: 16px; margin-right: 8px; accent-color: #e94560; cursor: pointer; flex-shrink: 0;
+  }
+  #cmdPanel .cp-empty { padding: 20px; text-align: center; color: #555; font-size: 13px; }
+  #cmdPanel .cp-quick-add {
+    padding: 8px 12px; border-top: 1px solid #0f3460; display: flex; gap: 6px;
+  }
+  #cmdPanel .cp-quick-add input {
+    flex: 1; background: #1a1a2e; border: 1px solid #0f3460; border-radius: 4px;
+    color: #e0e0e0; padding: 5px 8px; font-size: 12px; outline: none;
+  }
+  #cmdPanel .cp-quick-add input:focus { border-color: #e94560; }
+  #cmdPanel .cp-quick-add button {
+    background: #e94560; color: #fff; border: none; border-radius: 4px;
+    padding: 4px 10px; font-size: 12px; cursor: pointer; font-weight: bold;
+  }
+  #cmdPanel .cp-quick-add button:hover { background: #ff6b81; }
+  #cmdPanel .cp-quick-add #cmdSendSel { background: #27ae60; padding: 4px 8px; }
+  #cmdPanel .cp-quick-add #cmdSendSel:hover { background: #2ecc71; }
+  #cmdPanel .cp-add {
+    padding: 8px 12px; border-top: 1px solid #0f3460;
+    display: flex; gap: 6px;
+  }
+  #cmdPanel .cp-add input {
+    flex: 1; background: #1a1a2e; border: 1px solid #0f3460; border-radius: 4px;
+    color: #e0e0e0; padding: 4px 8px; font-size: 12px; outline: none;
+  }
+  #cmdPanel .cp-add input:focus { border-color: #e94560; }
+  #cmdPanel .cp-add button {
+    background: #e94560; color: #fff; border: none; border-radius: 4px;
+    padding: 4px 10px; font-size: 12px; cursor: pointer;
+  }
+  #cmdPanel .cp-add button:hover { background: #c73550; }
+  #cmdPanel .cp-foot {
+    padding: 6px 12px; border-top: 1px solid #0f3460;
+    display: flex; gap: 8px; justify-content: flex-end;
+  }
+  #cmdPanel .cp-foot button {
+    background: none; border: 1px solid #0f3460; color: #7f8c8d;
+    border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer;
+  }
+  #cmdPanel .cp-foot button:hover { color: #e0e0e0; border-color: #e0e0e0; }
+  /* 添加命令展开区域 */
+  #cmdPanel .cp-add-form { padding: 8px 12px; border-top: 1px solid #0f3460; display: none; }
+  #cmdPanel .cp-add-form.open { display: block; }
+  #cmdPanel .cp-add-form input {
+    width: 100%; background: #1a1a2e; border: 1px solid #0f3460; border-radius: 4px;
+    color: #e0e0e0; padding: 5px 8px; font-size: 12px; outline: none; margin-bottom: 6px;
+  }
+  #cmdPanel .cp-add-form input:focus { border-color: #e94560; }
+  #cmdPanel .cp-add-form .cp-add-actions { display: flex; gap: 6px; justify-content: flex-end; }
   .tw {
     position: absolute; top: 4px; left: 4px; right: 4px; bottom: 4px;
     display: none;
@@ -697,6 +851,36 @@ export class WebServer {
   <div class="foot">
     <span>WebSocket <span id="wsSt">connecting</span></span>
     <span>Ctrl+C 中断 \u00b7 Ctrl+D 退出</span>
+    <button id="cmdBtn" title="\u5e38\u7528\u547d\u4ee4">\u2318 \u547d\u4ee4</button>
+  </div>
+  <!-- 命令面板浮层 -->
+  <div id="cmdPanel">
+    <div class="cp-head">
+      <span>\u5e38\u7528\u547d\u4ee4</span>
+      <div>
+        <button id="cmdAddBtn" title="\u6dfb\u52a0\u547d\u4ee4">+</button>
+        <button id="cmdCloseBtn" title="\u5173\u95ed">\u2715</button>
+      </div>
+    </div>
+    <div class="cp-body" id="cmdList"></div>
+    <div class="cp-quick-add">
+      <button id="cmdSendSel" title="\u53d1\u9001\u52fe\u9009\u547d\u4ee4">\u25b6 \u53d1\u9001</button>
+      <input id="cmdQuickInput" placeholder="\u8f93\u5165\u547d\u4ee4\u56de\u8f66\u6dfb\u52a0" />
+      <button id="cmdQuickBtn" title="\u6dfb\u52a0">+</button>
+    </div>
+    <div class="cp-add-form" id="cmdAddForm">
+      <input id="cmdNewLabel" placeholder="\u547d\u4ee4\u540d\u79f0\uff08\u5982\uff1a\u5217\u51fa\u6587\u4ef6\uff09" />
+      <input id="cmdNewCmd" placeholder="\u5b9e\u9645\u547d\u4ee4\uff08\u5982\uff1als -la\uff09" />
+      <div class="cp-add-actions">
+        <button id="cmdAddCancel">\u53d6\u6d88</button>
+        <button id="cmdAddSave" style="background:#e94560;color:#fff;border:none;border-radius:4px;padding:4px 12px;font-size:12px;cursor:pointer;">\u4fdd\u5b58</button>
+      </div>
+    </div>
+    <div class="cp-foot">
+      <button id="cmdImportBtn">\u5bfc\u5165</button>
+      <button id="cmdExportBtn">\u5bfc\u51fa</button>
+    </div>
+    <input type="file" id="cmdImportFile" accept=".json" style="display:none" />
   </div>
   <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
@@ -712,6 +896,160 @@ export class WebServer {
     var ws = null;
     var rt = null;
     var rd = 1000;
+
+    // ===== 命令面板 =====
+    var cmdBtn = document.getElementById('cmdBtn');
+    var cmdPanel = document.getElementById('cmdPanel');
+    var cmdList = document.getElementById('cmdList');
+    var cmdAddBtn = document.getElementById('cmdAddBtn');
+    var cmdCloseBtn = document.getElementById('cmdCloseBtn');
+    var cmdAddForm = document.getElementById('cmdAddForm');
+    var cmdNewLabel = document.getElementById('cmdNewLabel');
+    var cmdNewCmd = document.getElementById('cmdNewCmd');
+    var cmdAddCancel = document.getElementById('cmdAddCancel');
+    var cmdAddSave = document.getElementById('cmdAddSave');
+    var cmdExportBtn = document.getElementById('cmdExportBtn');
+    var cmdImportBtn = document.getElementById('cmdImportBtn');
+    var cmdImportFile = document.getElementById('cmdImportFile');
+    var cmds = [];
+    var cmdsLoaded = false;
+
+    function loadCmds() {
+      var bot = active || '${botName}';
+      fetch('/api/commands/' + encodeURIComponent(bot)).then(function(r){ return r.json(); }).then(function(data){
+        cmds = data; cmdsLoaded = true; renderCmds();
+      }).catch(function(){ cmds = []; renderCmds(); });
+    }
+
+    function renderCmds() {
+      cmdList.innerHTML = '';
+      if (cmds.length === 0) {
+        cmdList.innerHTML = '<div class="cp-empty">\u6682\u65e0\u5e38\u7528\u547d\u4ee4</div>';
+        return;
+      }
+      cmds.forEach(function(cmd, i) {
+        var row = document.createElement('div');
+        row.className = 'cp-item';
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.className = 'cp-cb';
+        cb.dataset.idx = String(i);
+        var label = document.createElement('span');
+        label.className = 'cp-label';
+        label.textContent = cmd.label;
+        label.title = cmd.command;
+        var del = document.createElement('span');
+        del.className = 'cp-del';
+        del.textContent = '\u2715';
+        del.title = '\u5220\u9664';
+        del.onclick = function(e) {
+          e.stopPropagation();
+          fetch('/api/commands/' + encodeURIComponent(active || '${botName}') + '/' + i, {method:'DELETE'})
+            .then(function(r){ return r.json(); })
+            .then(function(data){ cmds = data; renderCmds(); });
+        };
+        row.appendChild(cb);
+        row.appendChild(label);
+        row.appendChild(del);
+        cmdList.appendChild(row);
+      });
+    }
+
+    function sendCmd(text) {
+      if (ws && ws.readyState === 1 && active) {
+        ws.send(JSON.stringify({type:'web-input', data: text + '\\r', targetBot: active}));
+      }
+    }
+
+    cmdBtn.onclick = function() {
+      var isOpen = cmdPanel.classList.contains('open');
+      if (isOpen) {
+        cmdPanel.classList.remove('open');
+      } else {
+        cmdPanel.classList.add('open');
+        if (!cmdsLoaded) loadCmds();
+      }
+    };
+    cmdCloseBtn.onclick = function() { cmdPanel.classList.remove('open'); };
+
+    cmdAddBtn.onclick = function() {
+      var f = cmdAddForm;
+      if (f.classList.contains('open')) { f.classList.remove('open'); }
+      else { f.classList.add('open'); cmdNewLabel.focus(); }
+    };
+    cmdAddCancel.onclick = function() { cmdAddForm.classList.remove('open'); cmdNewLabel.value=''; cmdNewCmd.value=''; };
+    cmdAddSave.onclick = function() {
+      var l = cmdNewLabel.value.trim(), c = cmdNewCmd.value.trim();
+      if (!l || !c) return;
+      fetch('/api/commands/' + encodeURIComponent(active || '${botName}'), {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({label:l, command:c})
+      }).then(function(r){ return r.json(); }).then(function(data){
+        cmds = data; renderCmds(); cmdNewLabel.value=''; cmdNewCmd.value=''; cmdAddForm.classList.remove('open');
+      });
+    };
+
+    // 快捷添加：输入命令回车即添加
+    var cmdQuickInput = document.getElementById('cmdQuickInput');
+    var cmdQuickBtn = document.getElementById('cmdQuickBtn');
+    function quickAdd() {
+      var text = cmdQuickInput.value.trim();
+      if (!text) return;
+      fetch('/api/commands/' + encodeURIComponent(active || '${botName}'), {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({label: text, command: text})
+      }).then(function(r){ return r.json(); }).then(function(data){
+        cmds = data; renderCmds(); cmdQuickInput.value = '';
+      });
+    }
+    cmdQuickInput.onkeydown = function(e) { if (e.key === 'Enter') { e.preventDefault(); quickAdd(); } };
+    cmdQuickBtn.onclick = quickAdd;
+
+    // 发送选中的命令
+    var cmdSendSel = document.getElementById('cmdSendSel');
+    cmdSendSel.onclick = function() {
+      var boxes = cmdList.querySelectorAll('.cp-cb:checked');
+      if (boxes.length === 0) return;
+      boxes.forEach(function(cb) {
+        var idx = parseInt(cb.dataset.idx, 10);
+        if (cmds[idx]) sendCmd(cmds[idx].command);
+      });
+      cmdPanel.classList.remove('open');
+    };
+
+    cmdExportBtn.onclick = function() {
+      var bot = active || '${botName}';
+      window.location.href = '/api/commands/' + encodeURIComponent(bot) + '/export';
+    };
+    cmdImportBtn.onclick = function() { cmdImportFile.click(); };
+    cmdImportFile.onchange = function() {
+      var file = cmdImportFile.files[0];
+      if (!file) return;
+      var reader = new FileReader();
+      reader.onload = function(e) {
+        try {
+          var data = JSON.parse(e.target.result);
+          fetch('/api/commands/' + encodeURIComponent(active || '${botName}') + '/import', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify(data)
+          }).then(function(r){ return r.json(); }).then(function(res){
+            loadCmds();
+          });
+        } catch(_) { alert('\u65e0\u6548\u7684 JSON \u6587\u4ef6'); }
+      };
+      reader.readAsText(file);
+      cmdImportFile.value = '';
+    };
+
+    // \u70b9\u51fb\u5176\u4ed6\u533a\u57df\u5173\u95ed\u9762\u677f
+    document.addEventListener('click', function(e) {
+      if (!cmdPanel.classList.contains('open')) return;
+      if (cmdPanel.contains(e.target) || cmdBtn.contains(e.target)) return;
+      cmdPanel.classList.remove('open');
+    });
+
+    // \u5207\u6362 bot \u65f6\u91cd\u65b0\u52a0\u8f7d\u547d\u4ee4
+    var origPick = null;
 
     function mkTerm(name) {
       if (tmap[name]) return tmap[name];
@@ -750,6 +1088,8 @@ export class WebServer {
       if (ws && ws.readyState === 1) {
         ws.send(JSON.stringify({ type: 'select-bot', botName: name }));
       }
+      cmdsLoaded = false;
+      if (cmdPanel.classList.contains('open')) loadCmds();
     }
 
     function setTabs(bots) {
