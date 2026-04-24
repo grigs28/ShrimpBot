@@ -1022,19 +1022,18 @@ export class FeishuBridge {
     return result.join('\n');
   }
 
-  /** 最终 patch：优先用 parser 内容（保证是当前轮），transcript 仅在 parser 为空时备用 */
+  /** 最终 patch：读 PTY 实时 buffer 获取完整内容 */
   private doFinalPatch(): void {
     if (this.completionHandled) return;
     this.completionHandled = true;
     if (this.stopHookTimer) { clearTimeout(this.stopHookTimer); this.stopHookTimer = null; }
     if (this.completionTimer) { clearTimeout(this.completionTimer); this.completionTimer = null; }
+    // 直接读 PTY buffer（❯ 已出现，buffer 包含完整当前响应）
+    const bufferText = this.pty.getBufferText().trim();
     const ptyText = (this.fallbackPtyText || '').trim();
-    const transcriptText = this.readLastAssistantFromTranscript(this.lastTranscriptPath).trim();
-    // parser 内容由 markNewRound 保证是当前轮的，优先使用
-    // 只在 parser 完全为空时才用 transcript（可能过时）
-    const content = ptyText || transcriptText;
-    const source = ptyText ? 'pty' : 'transcript';
-    logger.info(this.tag, `最终 patch: ${content.length}字 (source=${source}, pty=${ptyText.length}, transcript=${transcriptText.length})`);
+    // 优先用 buffer（最完整），其次 parser（当前轮保证）
+    const content = bufferText || ptyText;
+    logger.info(this.tag, `最终 patch: ${content.length}字 (buffer=${bufferText.length}, pty=${ptyText.length})`);
     if (content.trim()) {
       this.patchCard('green', '🟢 完成', content);
     }
