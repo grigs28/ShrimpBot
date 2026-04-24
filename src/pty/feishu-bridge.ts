@@ -910,10 +910,10 @@ export class FeishuBridge {
           if (this.stopHookTimer) clearTimeout(this.stopHookTimer);
           this.stopHookTimer = setTimeout(() => {
             if (this.completionHandled) { this.processQueue(); return; }
-            const ptyText = this.fallbackPtyText || '';
-            const transcriptText = this.readLastAssistantFromTranscript(this.lastTranscriptPath);
-            const content = transcriptText.length > ptyText.length ? transcriptText : ptyText;
-            logger.info(this.tag, `Hook Stop (进度): ${content.length}字`);
+            const ptyText = (this.fallbackPtyText || '').trim();
+            const transcriptText = this.readLastAssistantFromTranscript(this.lastTranscriptPath).trim();
+            const content = ptyText || transcriptText;
+            logger.info(this.tag, `Hook Stop (进度): ${content.length}字 (pty=${ptyText.length}, transcript=${transcriptText.length})`);
             if (content.trim() && this.currentCardId) {
               this.patchCard('blue', '🔄 处理中', content, true);
             }
@@ -1022,17 +1022,18 @@ export class FeishuBridge {
     return result.join('\n');
   }
 
-  /** 最终 patch：取 parser 和 transcript 中更完整的那个 */
+  /** 最终 patch：优先用 parser 内容（保证是当前轮），transcript 仅在 parser 为空时备用 */
   private doFinalPatch(): void {
     if (this.completionHandled) return;
     this.completionHandled = true;
     if (this.stopHookTimer) { clearTimeout(this.stopHookTimer); this.stopHookTimer = null; }
     if (this.completionTimer) { clearTimeout(this.completionTimer); this.completionTimer = null; }
-    const ptyText = this.fallbackPtyText || '';
-    const transcriptText = this.readLastAssistantFromTranscript(this.lastTranscriptPath);
-    // 用更长的那个（parser 可能截断，transcript 可能过时，取长者保证完整）
-    const content = transcriptText.length > ptyText.length ? transcriptText : ptyText;
-    const source = transcriptText.length > ptyText.length ? 'transcript' : 'pty';
+    const ptyText = (this.fallbackPtyText || '').trim();
+    const transcriptText = this.readLastAssistantFromTranscript(this.lastTranscriptPath).trim();
+    // parser 内容由 markNewRound 保证是当前轮的，优先使用
+    // 只在 parser 完全为空时才用 transcript（可能过时）
+    const content = ptyText || transcriptText;
+    const source = ptyText ? 'pty' : 'transcript';
     logger.info(this.tag, `最终 patch: ${content.length}字 (source=${source}, pty=${ptyText.length}, transcript=${transcriptText.length})`);
     if (content.trim()) {
       this.patchCard('green', '🟢 完成', content);
