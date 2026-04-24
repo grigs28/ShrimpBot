@@ -905,10 +905,9 @@ export class FeishuBridge {
           if (this.stopHookTimer) clearTimeout(this.stopHookTimer);
           this.stopHookTimer = setTimeout(() => {
             if (this.completionHandled) { this.processQueue(); return; }
-            let content = this.fallbackPtyText;
-            if (!content?.trim()) {
-              content = this.readLastAssistantFromTranscript(this.lastTranscriptPath);
-            }
+            const ptyText = this.fallbackPtyText || '';
+            const transcriptText = this.readLastAssistantFromTranscript(this.lastTranscriptPath);
+            const content = transcriptText.length > ptyText.length ? transcriptText : ptyText;
             logger.info(this.tag, `Hook Stop (进度): ${content.length}字`);
             if (content.trim() && this.currentCardId) {
               this.patchCard('blue', '🔄 处理中', content, true);
@@ -1018,18 +1017,18 @@ export class FeishuBridge {
     return result.join('\n');
   }
 
-  /** 最终 patch：优先用 PTY parser 内容，transcript 作为备用 */
+  /** 最终 patch：取 parser 和 transcript 中更完整的那个 */
   private doFinalPatch(): void {
     if (this.completionHandled) return;
     this.completionHandled = true;
     if (this.stopHookTimer) { clearTimeout(this.stopHookTimer); this.stopHookTimer = null; }
     if (this.completionTimer) { clearTimeout(this.completionTimer); this.completionTimer = null; }
-    // 优先用 fallbackPtyText（parser 当前轮解析，markNewRound 保证内容正确）
-    let content = this.fallbackPtyText;
-    if (!content?.trim()) {
-      content = this.readLastAssistantFromTranscript(this.lastTranscriptPath);
-    }
-    logger.info(this.tag, `最终 patch: ${content.length}字 (source=${this.fallbackPtyText?.trim() ? 'pty' : 'transcript'})`);
+    const ptyText = this.fallbackPtyText || '';
+    const transcriptText = this.readLastAssistantFromTranscript(this.lastTranscriptPath);
+    // 用更长的那个（parser 可能截断，transcript 可能过时，取长者保证完整）
+    const content = transcriptText.length > ptyText.length ? transcriptText : ptyText;
+    const source = transcriptText.length > ptyText.length ? 'transcript' : 'pty';
+    logger.info(this.tag, `最终 patch: ${content.length}字 (source=${source}, pty=${ptyText.length}, transcript=${transcriptText.length})`);
     if (content.trim()) {
       this.patchCard('green', '🟢 完成', content);
     }
