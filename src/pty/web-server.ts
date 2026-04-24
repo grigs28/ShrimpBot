@@ -490,41 +490,22 @@ export class WebServer {
         ws.send(JSON.stringify({ type: 'auth-ok' }));
         ws.send(JSON.stringify({ type: 'bot-list', bots: this.getBotList() }));
       }
-      const authTimer = this.noAuth ? null : setTimeout(() => {
-        if (!authenticated) {
-          ws.close(4001, '未认证');
-        }
-      }, 5000);
+      // 非 noAuth 模式：能加载页面说明已通过 HTTP 认证，WS 直接信任
+      if (!this.noAuth) {
+        authenticated = true;
+        this.clients.add(ws);
+        ws.send(JSON.stringify({ type: 'auth-ok' }));
+        ws.send(JSON.stringify({ type: 'bot-list', bots: this.getBotList() }));
+        logger.info(this.tag, `WebSocket 已认证(页面信任): ${ip}`);
+      }
 
       ws.on('message', (msg: Buffer) => {
-        // 首条消息检查认证
-        if (!authenticated) {
-          try {
-            const parsed = JSON.parse(msg.toString());
-            if (parsed.type === 'auth' && parsed.token) {
-              authenticated = true;
-              if (authTimer) clearTimeout(authTimer);
-              this.clients.add(ws);
-              ws.send(JSON.stringify({ type: 'auth-ok' }));
-              ws.send(JSON.stringify({ type: 'bot-list', bots: this.getBotList() }));
-              logger.info(this.tag, `WebSocket 已认证: ${ip}`);
-              return;
-            }
-          } catch { /* fall through */ }
-          ws.close(4001, '未认证');
-          return;
-        }
-
-        // 已认证：正常处理消息
         this.handleClientMessage(ws, msg);
       });
 
       ws.on('close', () => {
-        if (authTimer) clearTimeout(authTimer);
         this.clients.delete(ws);
-        if (authenticated) {
-          logger.info(this.tag, `WebSocket 断开: ${ip} (剩余: ${this.clients.size})`);
-        }
+        logger.info(this.tag, `WebSocket 断开: ${ip} (剩余: ${this.clients.size})`);
       });
     });
   }
@@ -728,12 +709,12 @@ export class WebServer {
   }
   .tab-bar.show { display: flex; }
   .tab {
-    padding: 8px 16px; font-size: 14px; font-weight: bold; color: #a0a0a0;
+    padding: 8px 16px; font-size: 14px; color: #7f8c8d;
     cursor: pointer; border-bottom: 2px solid transparent;
     transition: all 0.2s; user-select: none;
   }
-  .tab:hover { color: #f0f0f0; }
-  .tab.on { color: #ffd700; border-bottom-color: #ffd700; text-shadow: 0 0 8px rgba(255,215,0,0.5); }
+  .tab:hover { color: #e0e0e0; }
+  .tab.on { color: #e94560; border-bottom-color: #e94560; }
   #terms { flex: 1; padding: 4px; overflow: hidden; position: relative; }
   /* 命令面板按钮 — 在 footer 内，右对齐 */
   .foot { position: relative; }
