@@ -905,8 +905,11 @@ export class FeishuBridge {
           if (this.stopHookTimer) clearTimeout(this.stopHookTimer);
           this.stopHookTimer = setTimeout(() => {
             if (this.completionHandled) { this.processQueue(); return; }
-            const content = this.readLastAssistantFromTranscript(this.lastTranscriptPath);
-            logger.info(this.tag, `Hook Stop (进度): transcript=${content.length}字`);
+            let content = this.fallbackPtyText;
+            if (!content?.trim()) {
+              content = this.readLastAssistantFromTranscript(this.lastTranscriptPath);
+            }
+            logger.info(this.tag, `Hook Stop (进度): ${content.length}字`);
             if (content.trim() && this.currentCardId) {
               this.patchCard('blue', '🔄 处理中', content, true);
             }
@@ -1015,14 +1018,18 @@ export class FeishuBridge {
     return result.join('\n');
   }
 
-  /** 最终 patch：从 transcript 读内容（不使用 PTY buffer） */
+  /** 最终 patch：优先用 PTY parser 内容，transcript 作为备用 */
   private doFinalPatch(): void {
     if (this.completionHandled) return;
     this.completionHandled = true;
     if (this.stopHookTimer) { clearTimeout(this.stopHookTimer); this.stopHookTimer = null; }
     if (this.completionTimer) { clearTimeout(this.completionTimer); this.completionTimer = null; }
-    const content = this.readLastAssistantFromTranscript(this.lastTranscriptPath);
-    logger.info(this.tag, `最终 patch: ${content.length}字 (transcript=${this.lastTranscriptPath ? 'yes' : 'no'})`);
+    // 优先用 fallbackPtyText（parser 当前轮解析，markNewRound 保证内容正确）
+    let content = this.fallbackPtyText;
+    if (!content?.trim()) {
+      content = this.readLastAssistantFromTranscript(this.lastTranscriptPath);
+    }
+    logger.info(this.tag, `最终 patch: ${content.length}字 (source=${this.fallbackPtyText?.trim() ? 'pty' : 'transcript'})`);
     if (content.trim()) {
       this.patchCard('green', '🟢 完成', content);
     }
