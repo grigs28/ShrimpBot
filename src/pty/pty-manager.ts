@@ -136,6 +136,10 @@ export class PTYManager {
   /** 直接写入 PTY（透传模式） */
   writeRaw(data: string): void {
     if (this.pty && this.running) {
+      // 检测到回车（新命令提交）时重置 parser，确保响应能正确解析
+      if (data.includes('\r')) {
+        this.parser.markNewRound();
+      }
       logger.info(this.tag, `← writeRaw: ${JSON.stringify(data)}`);
       this.pty.write(data);
     }
