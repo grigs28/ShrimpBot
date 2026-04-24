@@ -423,6 +423,8 @@ export class FeishuBridge {
         // 优先用 PTY buffer（包含表格等未 flush 内容）
         const bufferText = this.pty.getBufferText();
         this.streamBuffer = bufferText || text;
+        // 流式更新 fallbackPtyText，确保 Stop hook 在完成前触发时也有当前轮内容
+        this.fallbackPtyText = text;
       }
       return;
     }
