@@ -60,15 +60,16 @@ All three endpoints share a single Claude Code PTY instance. Any change to data 
 - **Feishu**: PTY data goes through `OutputParser.parse()` to extract clean text, then sent as interactive cards (non-clone: 🔵 thinking → 🟢 complete / 🟡 options / 🔴 error) or plain text (clone mode).
 
 **Operation (any endpoint input → Claude):**
-- **Terminal stdin** → `pty.writeRaw()` → PTY
-- **Web WebSocket** → `pty.writeRaw()` → PTY
+- **Terminal stdin** → `pty.writeRaw()` (with `markNewRound()` on Enter) → PTY
+- **Web WebSocket** → `pty.writeRaw()` (with `markNewRound()` on Enter) → PTY
 - **Feishu message** → `pty.send()` (with `markNewRound()`) → PTY
-- **API `POST /api/send`** → `pty.writeRaw()` → PTY
+- **API `POST /api/send`** → `pty.writeRaw()` (with `markNewRound()` on Enter) → PTY
 
 **Rules:**
 - No duplication: each endpoint receives content exactly once. Feishu uses incremental diff (`lastSentTextMap`); completion sends only remaining delta.
 - No omission: `firstMessageReceived` is set to `true` when any endpoint receives its first real text input. Only after this flag is set does Claude output get forwarded to Feishu (prevents startup noise from being sent).
 - Format adaptation: Terminal and Web get raw ANSI; Feishu gets parsed plain text.
+- State reset: All input paths call `markNewRound()` on Enter to reset OutputParser state. `handleExternalCommand()` and `dispatchToClaude()` also reset `streamBuffer`, `fallbackPtyText`, and `lastTranscriptPath`.
 
 ### Message Flow
 
@@ -85,12 +86,29 @@ Claude Code output → PTYManager.onData()
 
 ### Hook Events
 
-Claude Code hooks (`Stop`, `Notification`, `PostToolUseFailure`) POST to `/api/hook`. In non-clone mode, `Stop` reads `transcript_path` to extract the final assistant message and patches the Feishu card. This is a fallback when PTY parsing misses completion.
+Claude Code hooks (`Stop`, `Notification`, `PostToolUseFailure`) POST to `/api/hook`. In non-clone mode, `doFinalPatch()` prioritizes `fallbackPtyText` (from OutputParser, guaranteed current-round content) over transcript file (which may contain stale data from intermediate Stops). Transcript is used as fallback only.
+
+### Web Authentication
+
+- yz-login SSO integration for web terminal (port 5554)
+- Local user management via `~/.shrimpbot/users.json`: `grigs` is super admin, all others default to `user` role
+- SSO's `is_admin` is ignored; only local role matters
+- `--no-auth` flag skips authentication entirely
+- Admin-only settings page at `/settings` with system config, user management, bot management
+
+### Command Palette
+
+- Per-bot command storage at `~/.shrimpbot/commands/{botName}.json`
+- Web UI: red "⌘ 命令" button in footer, floating panel with checkboxes for batch send
+- Quick-add input (type command + Enter to add), export/import as JSON
+- API: `GET/POST/DELETE /api/commands/:botName`, `GET /export`, `POST /import`
 
 ### Multi-Bot / Multi-Chat
 
 - `sbot init` registers bots in `~/.shrimpbot/bots.json`. Active bot is saved to `config.json`.
-- New chats are auto-discovered and saved to `config.json`.
+- `chatIds` are stored per-bot in `bots.json`, not in global `config.json`.
+- Each project's `.sbot` file binds to a specific bot via `FEISHU_BOT_NAME=<name>` so multiple terminals can run different bots simultaneously.
+- New chats are auto-discovered and saved to the bot entry in `bots.json`.
 - Messages are queued per-bot; `claudeBusy` flag prevents concurrent Claude invocations.
 - Dangerous patterns (`rm -rf`, `drop table`, etc.) block auto-approval even for yes/no questions.
 
