@@ -320,6 +320,8 @@ export class FeishuBridge {
     this.streamBuffer = '';
     this.fallbackPtyText = '';
     this.lastTranscriptPath = '';
+    if (this.stopHookTimer) { clearTimeout(this.stopHookTimer); this.stopHookTimer = null; }
+    if (this.completionTimer) { clearTimeout(this.completionTimer); this.completionTimer = null; }
 
     const chatLabel = event.chatType === 'p2p' ? '私聊' : '群聊';
     logger.info(this.tag, `[${chatLabel}] 飞书 → Claude: "${text.slice(0, 100)}" (${event.chatId})`);
@@ -359,6 +361,7 @@ export class FeishuBridge {
 
     // 清理上一轮的 timer
     if (this.stopHookTimer) { clearTimeout(this.stopHookTimer); this.stopHookTimer = null; }
+    if (this.completionTimer) { clearTimeout(this.completionTimer); this.completionTimer = null; }
 
     // 重置状态
     this.completionHandled = false;
