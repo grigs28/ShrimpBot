@@ -63,6 +63,7 @@ export interface HookEvent {
   reason?: string;
   stop_hook_reason?: string;
   stop_hook_active?: boolean;
+  last_assistant_message?: string;
   transcript_messages?: Array<{ role: string; content: string | Array<Record<string, unknown>> }>;
   // Notification
   message?: string;

@@ -53,6 +53,7 @@ export class FeishuBridge {
   private fallbackPtyText = '';
   /** 最后一次 Hook Stop 传入的 transcript_path */
   private lastTranscriptPath = '';
+  private lastAssistantMessage = '';
   /** 是否已收到第一条飞书消息（启动前的 PTY 输出不发送到飞书） */
   private firstMessageReceived = false;
   /** 当前轮次是否已发过 Notification（"Claude is waiting" 只发一次） */
@@ -320,6 +321,7 @@ export class FeishuBridge {
     this.streamBuffer = '';
     this.fallbackPtyText = '';
     this.lastTranscriptPath = '';
+    this.lastAssistantMessage = '';
     if (this.stopHookTimer) { clearTimeout(this.stopHookTimer); this.stopHookTimer = null; }
     if (this.completionTimer) { clearTimeout(this.completionTimer); this.completionTimer = null; }
 
@@ -370,6 +372,7 @@ export class FeishuBridge {
     this.streamBuffer = '';
     this.fallbackPtyText = '';
     this.lastTranscriptPath = '';
+    this.lastAssistantMessage = '';
 
     // 非 clone 模式发思考卡片
     if (!this.config.clone) {
@@ -896,7 +899,8 @@ export class FeishuBridge {
       case 'Stop': {
         if (event.stop_hook_active) return; // 防止循环
         if (event.transcript_path) this.lastTranscriptPath = event.transcript_path;
-        logger.info(this.tag, `Hook Stop: completionHandled=${this.completionHandled}, ptyReady=${this.ptyReady}, currentCardId=${!!this.currentCardId}`);
+        if (event.last_assistant_message) this.lastAssistantMessage = event.last_assistant_message;
+        logger.info(this.tag, `Hook Stop: completionHandled=${this.completionHandled}, ptyReady=${this.ptyReady}, hookMsg=${(event.last_assistant_message || '').length}字`);
         // 非 clone 模式：Stop 驱动完成卡片
         if (!this.config.clone && !this.completionHandled) {
           // PTY 已就绪（❯ 已到）→ 立即完成（不再等 debounce）
@@ -910,10 +914,10 @@ export class FeishuBridge {
           if (this.stopHookTimer) clearTimeout(this.stopHookTimer);
           this.stopHookTimer = setTimeout(() => {
             if (this.completionHandled) { this.processQueue(); return; }
-            const ptyText = (this.fallbackPtyText || '').trim();
-            const transcriptText = this.readLastAssistantFromTranscript(this.lastTranscriptPath).trim();
-            const content = ptyText || transcriptText;
-            logger.info(this.tag, `Hook Stop (进度): ${content.length}字 (pty=${ptyText.length}, transcript=${transcriptText.length})`);
+            const hookMsg = (this.lastAssistantMessage || '').trim();
+            const bufferText = this.pty.getBufferText().trim();
+            const content = hookMsg || bufferText;
+            logger.info(this.tag, `Hook Stop (进度): ${content.length}字 (hook=${hookMsg.length}, buffer=${bufferText.length})`);
             if (content.trim() && this.currentCardId) {
               this.patchCard('blue', '🔄 处理中', content, true);
             }
@@ -1022,18 +1026,19 @@ export class FeishuBridge {
     return result.join('\n');
   }
 
-  /** 最终 patch：读 PTY 实时 buffer 获取完整内容 */
+  /** 最终 patch：优先用 Stop hook 的 last_assistant_message */
   private doFinalPatch(): void {
     if (this.completionHandled) return;
     this.completionHandled = true;
     if (this.stopHookTimer) { clearTimeout(this.stopHookTimer); this.stopHookTimer = null; }
     if (this.completionTimer) { clearTimeout(this.completionTimer); this.completionTimer = null; }
-    // 直接读 PTY buffer（❯ 已出现，buffer 包含完整当前响应）
+    // 优先级：last_assistant_message > PTY buffer > parser
+    const hookMsg = (this.lastAssistantMessage || '').trim();
     const bufferText = this.pty.getBufferText().trim();
     const ptyText = (this.fallbackPtyText || '').trim();
-    // 优先用 buffer（最完整），其次 parser（当前轮保证）
-    const content = bufferText || ptyText;
-    logger.info(this.tag, `最终 patch: ${content.length}字 (buffer=${bufferText.length}, pty=${ptyText.length})`);
+    const content = hookMsg || bufferText || ptyText;
+    const source = hookMsg ? 'hook' : bufferText ? 'buffer' : 'pty';
+    logger.info(this.tag, `最终 patch: ${content.length}字 (source=${source}, hook=${hookMsg.length}, buffer=${bufferText.length}, pty=${ptyText.length})`);
     if (content.trim()) {
       this.patchCard('green', '🟢 完成', content);
     }
