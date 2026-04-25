@@ -54,6 +54,8 @@ export class FeishuBridge {
   /** 最后一次 Hook Stop 传入的 transcript_path */
   private lastTranscriptPath = '';
   private lastAssistantMessage = '';
+  /** 调试：已打印过 mentions 结构 */
+  private _mentionDebugLogged = false;
   /** 是否已收到第一条飞书消息（启动前的 PTY 输出不发送到飞书） */
   private firstMessageReceived = false;
   /** 当前轮次是否已发过 Notification（"Claude is waiting" 只发一次） */
@@ -183,12 +185,43 @@ export class FeishuBridge {
           const msg = data.message;
           const sender = data.sender;
           if (!msg) return;
+
+          // 群聊消息：只处理 @当前机器人 或 @所有人 的消息（多 Bot 同群时过滤）
+          const chatType = msg.chat_type || 'p2p';
+          if (chatType === 'group') {
+            const mentions: Array<Record<string, any>> = msg.mentions || [];
+            const myAppId = this.config.feishuAppId;
+            const myBotName = this.config.botName || '';
+
+            // 调试日志
+            logger.info(this.tag, `群聊消息 mentions=${JSON.stringify(mentions)} rawContent=${msg.content} (我=${myBotName})`);
+
+            // 检查是否 @了所有人（飞书用 @_all 表示 @所有人，mentions 为空数组）
+            const rawText = msg.content || '';
+            const mentionAll = rawText.includes('@_all') ||
+              mentions.some(m =>
+                m?.id?.open_id === 'all' ||
+                m?.key === 'all' ||
+                m?.name === '所有人'
+              );
+            // 检查是否 @了当前机器人（用 name 匹配）
+            const mentionedMe = mentions.some(m =>
+              (myBotName && m?.name === myBotName) ||
+              m?.id?.app_id === myAppId ||
+              m?.id?.open_id === myAppId
+            );
+            if (!mentionAll && !mentionedMe) {
+              logger.info(this.tag, `群聊消息未 @我(${myBotName})，忽略`);
+              return;
+            }
+          }
+
           const event: FeishuEvent = {
             chatId: msg.chat_id,
-            chatType: msg.chat_type || 'p2p',
+            chatType,
             userId: sender?.sender_id?.open_id || '',
             messageId: msg.message_id,
-            text: this.parseMessageContent(msg.message_type, msg.content),
+            text: this.parseMessageContent(msg.message_type, msg.content, msg.mentions),
             messageType: msg.message_type || 'text',
             timestamp: Date.now(),
           };
@@ -1089,12 +1122,39 @@ export class FeishuBridge {
     logger.info(this.tag, `已保存 [${label}] chatId: ${chatId} (总计: ${newChatIds.length})`);
   }
 
-  private parseMessageContent(messageType: string, content: string): string {
+  /**
+   * 解析飞书消息内容，清理 @mention 占位符
+   * 飞书会把 @用户名 替换为 @_user_N 占位符，需要还原为实际名字
+   */
+  private parseMessageContent(messageType: string, content: string, mentions?: Array<Record<string, any>>): string {
     if (!content) return '';
     try {
       const parsed = JSON.parse(content);
-      if (messageType === 'text') return parsed.text || '';
-      return parsed.text || content;
+      let text = parsed.text || '';
+      if (!text) return content;
+
+      // 替换 @_user_N 占位符为实际名字
+      if (mentions && mentions.length > 0) {
+        for (let i = 0; i < mentions.length; i++) {
+          const m = mentions[i];
+          const placeholder = m?.key || `_user_${i + 1}`;
+          const name = m?.name || '';
+          // 把 @_user_N 替换为 @名字，如果名字是"所有人"则去掉
+          if (name === '所有人') {
+            text = text.replace(new RegExp(`@${placeholder}\\s*`, 'g'), '');
+          } else if (name) {
+            text = text.replace(new RegExp(`@${placeholder}`, 'g'), `@${name}`);
+          } else {
+            text = text.replace(new RegExp(`@${placeholder}\\s*`, 'g'), '');
+          }
+        }
+      }
+
+      // 清理残留的 @_user_N 占位符和 @_all（@所有人）
+      text = text.replace(/@_user_\d+\s*/g, '');
+      text = text.replace(/@_all\s*/g, '');
+
+      return text.trim();
     } catch { return content; }
   }
 

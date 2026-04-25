@@ -170,12 +170,31 @@ function saveShrimpBotState(bot: BotEntry, chatIds: string[]): void {
  * 交互式配置向导，返回 BridgeConfig
  */
 export async function setupWizard(): Promise<BridgeConfig> {
-  console.log('🦐 ShrimpBot Bridge — 首次配置\n');
+  console.log('🦐 ShrimpBot Bridge — 配置向导\n');
 
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
   });
+
+  // 检查当前项目是否已绑定咪
+  const sbotPath = path.join(process.cwd(), '.sbot');
+  if (fs.existsSync(sbotPath)) {
+    const sbotContent = fs.readFileSync(sbotPath, 'utf-8');
+    const botLine = sbotContent.split('\n').find(l => l.startsWith('FEISHU_BOT_NAME='));
+    if (botLine) {
+      const currentBot = botLine.split('=').slice(1).join('=').trim();
+      console.log(`⚠️  当前项目已绑定：${currentBot}`);
+      console.log(`   每个项目目录只能绑定一只咪。`);
+      const confirm = await ask(rl, `   覆盖为新咪？(y/N)：`);
+      if (confirm.toLowerCase() !== 'y') {
+        console.log('已取消。');
+        rl.close();
+        process.exit(0);
+      }
+      console.log('');
+    }
+  }
 
   try {
     // 1. 选择机器人
