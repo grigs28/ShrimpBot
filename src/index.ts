@@ -20,7 +20,7 @@ import type { Config } from './types/index.js';
 
 // sbot 自己的参数（只解析这些，其余全部透传给 Claude）
 const SBOT_FLAGS = new Set(['--debug', '--clone', '--web', '--web-server', '--no-auth', '-h', '--help']);
-const SBOT_OPTIONS = new Set(['--command', '--cwd', '--chat', '--app-id', '--app-secret', '--name']);
+const SBOT_OPTIONS = new Set(['--command', '--cwd', '--chat', '--app-id', '--app-secret', '--name', '--web-host']);
 
 interface CliArgs {
   command?: string;
@@ -31,6 +31,7 @@ interface CliArgs {
   web?: boolean;
   webServer?: boolean;
   noAuth?: boolean;
+  webHost?: string;
   appId?: string;
   appSecret?: string;
   name?: string;
@@ -76,6 +77,7 @@ function parseArgs(): CliArgs {
         case '--app-id': args.appId = value; break;
         case '--app-secret': args.appSecret = value; break;
         case '--name': args.name = value; break;
+        case '--web-host': args.webHost = value; break;
       }
       i++;
       continue;
@@ -120,6 +122,7 @@ sbot 选项:
   --web                    启用 Web 终端（飞书+终端+Web 三端模式）
                             仅 --web 不带飞书配置时为纯 Web 模式
   --web-server             独立 Web 服务（不启动 PTY/飞书，仅 Web UI + API）
+  --web-host <地址>        远程 WebServer 地址（如 192.168.0.19:5554），直连不启动本地
   --no-auth                禁用 Web 登录认证（开发/内网模式）
   -h, --help               显示帮助
 
@@ -373,6 +376,7 @@ async function startBridgeMode(): Promise<void> {
     clone: cliArgs.clone,
     webEnabled: cliArgs.web,
     webPort: parseInt(process.env.WEB_PORT || '5554', 10),
+    webHost: cliArgs.webHost || process.env.WEBSERVER_HOST,
   });
 
   await bridge.start();

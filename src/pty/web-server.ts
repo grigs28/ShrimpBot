@@ -22,6 +22,8 @@ export interface WebServerDeps {
   getTerminalSize?: () => { cols: number; rows: number };
   /** Bot 名称 */
   botName?: string;
+  /** Claude 工作目录（用于 tab 标题显示） */
+  cwd?: string;
   /** Claude Code Hook 事件回调 */
   onHookEvent?: (event: HookEvent) => void;
   /** yz-login 服务地址 */
@@ -235,10 +237,12 @@ export class WebServer {
       const msgCount = hasTranscript ? (event as any).transcript_messages.length : 0;
       logger.info(this.tag, `Hook 原始数据: ${event.hook_event_name}, bot=${botName || 'local'}, keys=[${keys.join(',')}], transcript=${hasTranscript}(${msgCount}条)`);
 
+      let forwardedToRemote = false;
       if (botName) {
         const ws = this.botConnections.get(botName);
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: 'hook', event }));
+          forwardedToRemote = true;
         } else {
           logger.warn(this.tag, `Hook 路由失败: bot "${botName}" 未连接`);
         }
@@ -246,10 +250,12 @@ export class WebServer {
         for (const [, ws] of this.botConnections) {
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'hook', event }));
+            forwardedToRemote = true;
           }
         }
       }
-      if (this.deps.onHookEvent) {
+      // 仅当未转发给远端 bot 时才本地处理，避免双重触发 doFinalPatch
+      if (!forwardedToRemote && this.deps.onHookEvent) {
         this.deps.onHookEvent(event);
       }
       res.json({ ok: true });
@@ -673,12 +679,14 @@ export class WebServer {
   /** 前端终端页面（支持多咪标签页 + 用户认证） */
   private getTerminalPage(user: SessionUser): string {
     const botName = this.deps.botName || 'ShrimpBot';
+    const cwdName = this.deps.cwd?.split('/').filter(Boolean).pop() || '';
+    const titleSuffix = cwdName ? `${cwdName} — ${botName}` : botName;
     return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>${botName} — Web Terminal</title>
+<title>${titleSuffix}</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }

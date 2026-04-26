@@ -22,6 +22,8 @@ export interface BridgeConfig {
   webPort?: number;
   /** 是否启用 Web 终端（默认 false） */
   webEnabled?: boolean;
+  /** 远程 WebServer 地址（如 192.168.0.19:5554），配置后直连不启动本地 */
+  webHost?: string;
 }
 
 interface ChatInfo {
@@ -90,6 +92,8 @@ export class FeishuBridge {
   /** 非 clone 模式：当前 interactive 卡片的 messageId（用于 patch 更新） */
   private currentCardId: string | null = null;
   private currentCardChatId: string | null = null;
+  /** 思考卡片轮次 ID（防止旧异步调用覆盖新轮次） */
+  private _thinkingRoundId = 0;
 
   private responseChatId = '';
   private defaultChatId = '';
@@ -138,6 +142,7 @@ export class FeishuBridge {
       getBufferText: () => this.pty.getBufferText(),
       getTerminalSize: () => this.pty.getTerminalSize(),
       botName: config.botName,
+      cwd: config.claudeCwd,
       onHookEvent: (event) => this.handleHookEvent(event),
     }, config.webPort || 5554);
 
@@ -157,24 +162,35 @@ export class FeishuBridge {
   async start(): Promise<void> {
     this.pty.start();
 
-    // 始终启动 Web 服务（hook API + 可选的终端 UI）
-    const webPort = this.config.webPort || 5554;
-    const portAvailable = await WebServer.isPortAvailable(webPort);
-    if (portAvailable) {
-      this.webServer.start();
-      if (this.config.webEnabled) {
-        logger.info(this.tag, `Web 终端已启动: http://localhost:${webPort}`);
-      } else {
-        logger.info(this.tag, `Hook API 已启动: http://localhost:${webPort}/api/hook`);
+    const webHost = this.config.webHost;
+    if (webHost) {
+      // 有远程地址 → 直连，连不上跳过
+      logger.info(this.tag, `配置了远程 WebServer: ${webHost}，尝试连接...`);
+      try {
+        await this.connectToRemoteWebServer(webHost);
+        logger.info(this.tag, `已连接远程 WebServer: ${webHost}`);
+      } catch (err: any) {
+        logger.warn(this.tag, `无法连接远程 WebServer ${webHost}: ${err.message}，Web/Hook 不可用`);
       }
     } else {
-      // 端口被占 → 连接到已有 WebServer 作为 bot 提供者
-      logger.info(this.tag, `端口 ${webPort} 已被占用，连接到已有 WebServer`);
-      try {
-        await this.connectToRemoteWebServer(webPort);
-        logger.info(this.tag, `已连接 WebServer，Hook API 代理: http://localhost:${webPort}/api/hook`);
-      } catch (err: any) {
-        logger.warn(this.tag, `无法连接 WebServer: ${err.message}，Web/Hook 不可用`);
+      // 无远程地址 → 现有逻辑
+      const webPort = this.config.webPort || 5554;
+      const portAvailable = await WebServer.isPortAvailable(webPort);
+      if (portAvailable) {
+        this.webServer.start();
+        if (this.config.webEnabled) {
+          logger.info(this.tag, `Web 终端已启动: http://localhost:${webPort}`);
+        } else {
+          logger.info(this.tag, `Hook API 已启动: http://localhost:${webPort}/api/hook`);
+        }
+      } else {
+        logger.info(this.tag, `端口 ${webPort} 已被占用，连接到已有 WebServer`);
+        try {
+          await this.connectToRemoteWebServer(webPort);
+          logger.info(this.tag, `已连接 WebServer，Hook API 代理: http://localhost:${webPort}/api/hook`);
+        } catch (err: any) {
+          logger.warn(this.tag, `无法连接 WebServer: ${err.message}，Web/Hook 不可用`);
+        }
       }
     }
 
@@ -586,6 +602,9 @@ export class FeishuBridge {
 
   /** 发送 🔵 思考中卡片（用户提问时） */
   private async sendThinkingCard(chatId: string): Promise<void> {
+    // 生成轮次 ID 防止旧轮次异步回写覆盖新轮次
+    const roundId = Date.now();
+    this._thinkingRoundId = roundId;
     this.currentCardId = null;
     this.currentCardChatId = chatId;
     try {
@@ -597,8 +616,13 @@ export class FeishuBridge {
         },
         params: { receive_id_type: 'chat_id' },
       });
-      this.currentCardId = resp.data?.message_id || null;
-      logger.info(this.tag, `🔵 思考中卡片已发送: ${this.currentCardId}`);
+      // 仅当仍是当前轮次时才写入，避免旧 await 覆盖新卡片 ID
+      if (this._thinkingRoundId === roundId) {
+        this.currentCardId = resp.data?.message_id || null;
+        logger.info(this.tag, `🔵 思考中卡片已发送: ${this.currentCardId}`);
+      } else {
+        logger.info(this.tag, `🔵 跳过旧轮次思考卡片: roundId=${roundId}, 当前=${this._thinkingRoundId}`);
+      }
     } catch (err) {
       logger.error(this.tag, `发送思考卡片失败: ${err}`);
     }
@@ -646,7 +670,14 @@ export class FeishuBridge {
         },
         params: { receive_id_type: 'chat_id' },
       });
-      logger.info(this.tag, `新卡片已发送: ${title} (${resp.data?.message_id})`);
+      const newCardId = resp.data?.message_id || null;
+      logger.info(this.tag, `新卡片已发送: ${title} (${newCardId})`);
+      // 如果是 keepAlive 模式（进度更新），保存新 messageId 以便后续继续 patch
+      if (keepAlive && newCardId) {
+        this.currentCardId = newCardId;
+        this.currentCardChatId = chatId;
+        return;
+      }
     } catch (err) {
       // 最后降级纯文本
       logger.warn(this.tag, `卡片发送失败，降级 text: ${err}`);
@@ -1159,14 +1190,20 @@ export class FeishuBridge {
   }
 
   /** 连接到远程 WebServer 作为 bot 提供者（PTY 数据推送 + Web 输入接收 + Hook 事件接收） */
-  private connectToRemoteWebServer(port: number): Promise<void> {
+  private connectToRemoteWebServer(hostOrPort: string | number): Promise<void> {
     return new Promise((resolve, reject) => {
       const botId = this.config.botName || 'ShrimpBot';
       let reconnectDelay = 1000;
       let settled = false;
 
+      // 解析地址：字符串 "host:port" 或数字端口号（默认 127.0.0.1）
+      const address = typeof hostOrPort === 'string'
+        ? (hostOrPort.includes('://') ? hostOrPort : `ws://${hostOrPort}`)
+        : `ws://127.0.0.1:${hostOrPort}`;
+      const wsUrl = address.includes('/ws/bot') ? address : `${address}/ws/bot`;
+
       const connect = () => {
-        const ws = new WS(`ws://127.0.0.1:${port}/ws/bot`);
+        const ws = new WS(wsUrl);
 
         ws.on('open', () => {
           // 标识自己

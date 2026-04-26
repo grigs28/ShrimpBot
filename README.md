@@ -193,6 +193,90 @@ npm run dev         # 编译并启动
 npm test            # 运行测试
 ```
 
+## Windows 安装
+
+> **前提**：已安装 [Node.js](https://nodejs.org/) 20+（推荐 22 LTS）、[Git](https://git-scm.com/)、[Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)
+
+### 1. 克隆并安装
+
+```powershell
+git clone https://github.com/grigs28/ShrimpBot.git $HOME\ShrimpBot
+cd $HOME\ShrimpBot
+
+# node-pty 可能没有 Windows 预编译包，跳过后重试
+npm install --ignore-scripts
+npm rebuild node-pty
+```
+
+如果 `node-pty` rebuild 失败（缺少 Visual Studio Build Tools），可以跳过：
+```powershell
+npm install --ignore-scripts
+```
+核心功能（飞书通信）不受影响，但终端透传模式（PTY）不可用。
+
+### 2. 构建并启动
+
+```powershell
+npm run build
+sbot
+```
+
+`npm run build` 会编译 TypeScript 并通过 `npm link` 创建全局 `sbot` 命令。
+
+### 3. 配置
+
+```powershell
+# 交互式向导（首次启动自动进入）
+sbot init
+```
+
+或直接指定参数：
+```powershell
+sbot init --app-id cli_xxx --app-secret yyy --name "小虾虾"
+```
+
+项目目录下创建 `.sbot` 文件：
+```
+FEISHU_MODE=bridge
+```
+
+### 4. 远程 WebServer（可选）
+
+如果 WebServer 跑在另一台机器上：
+
+```powershell
+# 命令行
+sbot --web-host 192.168.0.19:5554
+
+# 或写在 .sbot 文件
+# WEBSERVER_HOST=192.168.0.19:5554
+```
+
+### 常见问题
+
+**Q: `npm install` 报 node-pty 错误**
+
+`node-pty` 缺少 Windows 预编译包。使用 `npm install --ignore-scripts` 跳过。
+
+**Q: `npm run build` 后 `sbot` 命令找不到**
+
+`npm link` 需要 admin 权限。用管理员 PowerShell 运行：
+```powershell
+cd $HOME\ShrimpBot
+npm link
+```
+
+或直接用 `node` 运行：
+```powershell
+node $HOME\ShrimpBot\dist\index.js
+```
+
+**Q: 飞书 Bot 收不到消息**
+
+1. 确认飞书开放平台已启用「长连接」模式
+2. 确认已添加事件 `im.message.receive_v1`
+3. 确认应用已「创建版本」并「发布」
+
 ## License
 
 MIT
