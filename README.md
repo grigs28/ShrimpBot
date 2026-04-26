@@ -94,6 +94,7 @@ sbot 选项:
   --clone                  飞书全量同步模式（所有回复都发飞书）
   --web                    启用 Web 终端
   --web-server             独立 Web 服务（不启动 PTY/飞书）
+  --web-host <地址>        远程 WebServer 地址（如 192.168.0.19:5554）
   -h, --help               显示帮助
 
 Claude 选项（全部透传给 Claude Code CLI）:
