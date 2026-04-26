@@ -371,7 +371,7 @@ async function startBridgeMode(): Promise<void> {
     chatIds,
     allowedUsers,
     claudePath: process.env.CLAUDE_PATH,
-    claudeCwd: process.env.CLAUDE_CWD,
+    claudeCwd: process.env.CLAUDE_CWD || process.cwd(),
     claudeExtraArgs: extraArgs.length > 0 ? extraArgs : undefined,
     clone: cliArgs.clone,
     webEnabled: cliArgs.web,

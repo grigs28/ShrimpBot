@@ -61,6 +61,8 @@ export class WebServer {
   private clients = new Set<WebSocket>();
   /** 多咪连接：botName → WebSocket */
   private botConnections = new Map<string, WebSocket>();
+  /** 远程 bot 的附加信息（cwd 等） */
+  private botInfo = new Map<string, { cwd: string }>();
   /** 当前活跃标签（浏览器端选中的 bot） */
   private activeBot = '';
   /** yz-login 服务地址 */
@@ -569,7 +571,11 @@ export class WebServer {
               existing.close();
             }
             this.botConnections.set(botName, ws);
-            logger.info(this.tag, `Bot 提供者已连接: ${botName} (总计: ${this.botConnections.size})`);
+            // 记录 bot 的 cwd（取目录名用于 tab 显示）
+            const cwdFull = parsed.cwd || '';
+            const cwdName = cwdFull.split('/').filter(Boolean).pop() || '';
+            this.botInfo.set(botName, { cwd: cwdName });
+            logger.info(this.tag, `Bot 提供者已连接: ${botName} cwd=${cwdName} (总计: ${this.botConnections.size})`);
             if (!this.activeBot) this.activeBot = botName;
             this.broadcastBotList();
             return;
@@ -593,6 +599,7 @@ export class WebServer {
       ws.on('close', () => {
         if (botName) {
           this.botConnections.delete(botName);
+          this.botInfo.delete(botName);
           logger.info(this.tag, `Bot 提供者已断开: ${botName} (剩余: ${this.botConnections.size})`);
           if (this.activeBot === botName) {
             this.activeBot = this.botConnections.keys().next().value || '';
@@ -603,16 +610,19 @@ export class WebServer {
     });
   }
 
-  /** 获取已连接 bot 列表（含本地 bot） */
-  private getBotList(): string[] {
-    const bots: string[] = [];
+  /** 获取已连接 bot 列表（含本地 bot），附带目录名 */
+  private getBotList(): Array<{ name: string; cwd: string }> {
+    const bots: Array<{ name: string; cwd: string }> = [];
     // 本地 bot（通过 deps 直接连接）
     if (this.deps.ptyWrite) {
-      bots.push(this.deps.botName || 'local');
+      const cwdName = this.deps.cwd?.split('/').filter(Boolean).pop() || '';
+      bots.push({ name: this.deps.botName || 'local', cwd: cwdName });
     }
     // 远程 bot（通过 /ws/bot 连接）
-    for (const name of this.botConnections.keys()) {
-      if (!bots.includes(name)) bots.push(name);
+    for (const [name, info] of this.botInfo.entries()) {
+      if (!bots.some(b => b.name === name)) {
+        bots.push({ name, cwd: info.cwd || '' });
+      }
     }
     return bots;
   }
@@ -1085,20 +1095,29 @@ export class WebServer {
       while (tabC.firstChild) tabC.removeChild(tabC.firstChild);
       if (bots.length <= 1) {
         tabC.className = 'tab-bar';
-        if (bots.length === 1) { mkTerm(bots[0]); pick(bots[0]); }
+        if (bots.length === 1) { mkTerm(bots[0].name || bots[0]); pick(bots[0].name || bots[0]); }
         return;
       }
       tabC.className = 'tab-bar show';
       for (var i = 0; i < bots.length; i++) {
+        var b = bots[i];
+        var name = b.name || b;
         var s = document.createElement('span');
         s.className = 'tab';
-        s.textContent = bots[i];
-        s.setAttribute('data-b', bots[i]);
-        s.onclick = (function(n){ return function(){ pick(n); }; })(bots[i]);
+        s.appendChild(document.createTextNode(name + ' '));
+        if (b.cwd) {
+          var y = document.createElement('span');
+          y.style.color = '#f1c40f';
+          y.textContent = '(' + b.cwd + ')';
+          s.appendChild(y);
+        }
+        s.setAttribute('data-b', name);
+        s.onclick = (function(n){ return function(){ pick(n); }; })(name);
         tabC.appendChild(s);
-        mkTerm(bots[i]);
+        mkTerm(name);
       }
-      if (!active || bots.indexOf(active) < 0) pick(bots[0]);
+      var first = (bots[0].name || bots[0]);
+      if (!active || !bots.some(function(x){ return (x.name||x)===active; })) pick(first);
     }
 
     function conn() {

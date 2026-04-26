@@ -1207,7 +1207,7 @@ export class FeishuBridge {
 
         ws.on('open', () => {
           // 标识自己
-          ws.send(JSON.stringify({ type: 'bot-join', name: botId }));
+          ws.send(JSON.stringify({ type: 'bot-join', name: botId, cwd: this.config.claudeCwd || process.cwd() }));
           reconnectDelay = 1000; // 连接成功，重置重连间隔
 
           // PTY 数据 → 远程 WebServer → 浏览器（附带 botName）
