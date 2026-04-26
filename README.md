@@ -214,16 +214,46 @@ npm install --ignore-scripts
 ```
 核心功能（飞书通信）不受影响，但终端透传模式（PTY）不可用。
 
-### 2. 构建并启动
+### 2. 构建
 
 ```powershell
-npm run build
+npx tsc
+```
+
+> `npm run build` 包含 `npm link`，Windows 上可能需要管理员权限。直接用 `npx tsc` 编译即可。
+
+### 3. 安装启动脚本
+
+将 `contrib/` 下的启动脚本复制到 PATH 目录：
+
+```powershell
+# 创建 bin 目录
+mkdir -Force $HOME\.local\bin
+
+# 复制脚本（PowerShell 用 .ps1，CMD 用 .cmd）
+Copy-Item contrib\sbot.ps1 $HOME\.local\bin\sbot.ps1
+Copy-Item contrib\sbot.cmd $HOME\.local\bin\sbot.cmd
+
+# 添加到 PATH（永久生效）
+[Environment]::SetEnvironmentVariable(
+    'Path',
+    [Environment]::GetEnvironmentVariable('Path','User') + ";$HOME\.local\bin",
+    'User'
+)
+
+# 重新打开终端后验证
+Get-Command sbot
+```
+
+### 4. 启动
+
+```powershell
+# cd 到项目目录（.sbot 所在目录）
+cd C:\Users\你\projects\my-project
 sbot
 ```
 
-`npm run build` 会编译 TypeScript 并通过 `npm link` 创建全局 `sbot` 命令。
-
-### 3. 配置
+### 5. 配置
 
 ```powershell
 # 交互式向导（首次启动自动进入）
@@ -240,7 +270,7 @@ sbot init --app-id cli_xxx --app-secret yyy --name "小虾虾"
 FEISHU_MODE=bridge
 ```
 
-### 4. 远程 WebServer（可选）
+### 远程 WebServer（可选）
 
 如果 WebServer 跑在另一台机器上：
 
@@ -258,18 +288,13 @@ sbot --web-host 192.168.0.19:5554
 
 `node-pty` 缺少 Windows 预编译包。使用 `npm install --ignore-scripts` 跳过。
 
-**Q: `npm run build` 后 `sbot` 命令找不到**
+**Q: `npm run build` 失败（`. `不是内部或外部命令）**
 
-`npm link` 需要 admin 权限。用管理员 PowerShell 运行：
-```powershell
-cd $HOME\ShrimpBot
-npm link
-```
+直接用 `npx tsc` 编译，跳过 `npm link`。然后用 `contrib/` 下的启动脚本。
 
-或直接用 `node` 运行：
-```powershell
-node $HOME\ShrimpBot\dist\index.js
-```
+**Q: `sbot` 命令找不到**
+
+确认 `$HOME\.local\bin` 在 PATH 中，且 `sbot.ps1` / `sbot.cmd` 已复制到该目录。重新打开终端后生效。
 
 **Q: 飞书 Bot 收不到消息**
 
