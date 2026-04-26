@@ -1,6 +1,33 @@
+import { execFileSync } from 'child_process';
 import { spawn, type IPty } from 'node-pty';
 import { OutputParser } from './output-parser.js';
 import { logger } from '../logger.js';
+
+/**
+ * Windows 上 node-pty 的 ConPTY 不会解析 .cmd 后缀，也不会走 shell PATH 解析。
+ * 它需要真正的 .exe 可执行文件路径。
+ * - claude 在 Windows 上是 npm 生成的 .cmd 包装脚本
+ * - .cmd 内部调用 claude.exe（@anthropic-ai/claude-code/bin/claude.exe）
+ * - ConPTY 直接调用 startProcess(file, ...)，不经过 shell
+ */
+function resolveClaudePath(claudePath: string): string {
+  if (process.platform !== 'win32') return claudePath;
+  // 用户显式指定了完整路径，直接用
+  if (claudePath.includes('/') || claudePath.includes('\\')) return claudePath;
+  // 优先：where claude.exe 查找真实 exe 路径
+  try {
+    const result = execFileSync('where', ['claude.exe'], { encoding: 'utf-8' });
+    const exePath = result.trim().split('\n')[0].trim();
+    if (exePath) return exePath;
+  } catch { /* where 找不到，走兜底 */ }
+  // 兜底：拼接 %APPDATA%/npm 默认路径
+  const appData = process.env.APPDATA;
+  if (appData) {
+    const defaultPath = `${appData}/npm/node_modules/@anthropic-ai/claude-code/bin/claude.exe`;
+    return defaultPath;
+  }
+  return claudePath;
+}
 
 export interface PTYOptions {
   claudePath?: string;
@@ -43,7 +70,7 @@ export class PTYManager {
       throw new Error('PTY already running');
     }
 
-    const claudePath = this.options.claudePath || 'claude';
+    const claudePath = resolveClaudePath(this.options.claudePath || 'claude');
     // extraArgs 去重（防止 --dangerously-skip-permissions 重复）
     const baseArgs = ['--dangerously-skip-permissions'];
     const extraArgs = (this.options.extraArgs || []).filter(

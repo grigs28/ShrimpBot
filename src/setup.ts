@@ -137,13 +137,31 @@ async function selectChats(
 }
 
 function saveShrimpBotState(bot: BotEntry, chatIds: string[]): void {
-  // chatIds 写入 bots.json 对应 bot entry
   const bots = loadBots();
+
+  // 检查是否切换了咪 → 清理旧咪在这个目录的 chatIds
+  const sbotPath = path.join(process.cwd(), '.sbot');
+  if (fs.existsSync(sbotPath)) {
+    const oldBotLine = fs.readFileSync(sbotPath, 'utf-8')
+      .split('\n').find(l => l.startsWith('FEISHU_BOT_NAME='));
+    if (oldBotLine) {
+      const oldBotName = oldBotLine.split('=').slice(1).join('=').trim();
+      if (oldBotName && oldBotName !== bot.name) {
+        const oldEntry = bots.find(b => b.name === oldBotName);
+        if (oldEntry && oldEntry.chatIds && oldEntry.chatIds.length > 0) {
+          console.log(`🧹 清理旧咪 ${oldBotName} 的 chatIds: ${oldEntry.chatIds.join(', ')}`);
+          oldEntry.chatIds = [];
+        }
+      }
+    }
+  }
+
+  // chatIds 写入新 bot entry
   const entry = bots.find(b => b.appId === bot.appId);
   if (entry) {
     entry.chatIds = chatIds;
-    saveBots(bots);
   }
+  saveBots(bots);
 
   // config.json 只存 activeBotName + claudeCwd
   saveShrimpBotConfig({
@@ -153,16 +171,16 @@ function saveShrimpBotState(bot: BotEntry, chatIds: string[]): void {
   console.log(`\n✅ 已保存到 ~/.shrimpbot/`);
 
   // 写入/更新本地 .sbot（项目级配置，含 FEISHU_BOT_NAME）
-  const sbotPath = path.join(process.cwd(), '.sbot');
+  const sbotFile = path.join(process.cwd(), '.sbot');
   let lines: string[] = [];
-  if (fs.existsSync(sbotPath)) {
-    lines = fs.readFileSync(sbotPath, 'utf-8').split('\n').filter(l => !l.startsWith('FEISHU_BOT_NAME=') && l.trim());
+  if (fs.existsSync(sbotFile)) {
+    lines = fs.readFileSync(sbotFile, 'utf-8').split('\n').filter(l => !l.startsWith('FEISHU_BOT_NAME=') && l.trim());
   }
   if (!lines.includes('FEISHU_MODE=bridge')) {
     lines.push('FEISHU_MODE=bridge');
   }
   lines.push(`FEISHU_BOT_NAME=${bot.name}`);
-  fs.writeFileSync(sbotPath, lines.join('\n') + '\n');
+  fs.writeFileSync(sbotFile, lines.join('\n') + '\n');
   console.log(`📝 已更新 .sbot: FEISHU_BOT_NAME=${bot.name}`);
 }
 
