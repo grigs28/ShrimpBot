@@ -220,7 +220,7 @@ async function startWebOnlyMode(): Promise<void> {
   ];
 
   // 写入 hook 配置
-  ensureHookSettings(webPort);
+  ensureHookSettings(`localhost:${webPort}`);
 
   const pty = new PTYManager({
     claudePath: process.env.CLAUDE_PATH,
@@ -362,7 +362,10 @@ async function startBridgeMode(): Promise<void> {
 
   // 写入 hook 配置到 .claude/settings.local.json
   const webPort = parseInt(process.env.WEB_PORT || '5554', 10);
-  ensureHookSettings(webPort, botName);
+  const webHost = cliArgs.webHost || process.env.WEBSERVER_HOST;
+  // hook 发到 webHost（远程）或本地 WebServer
+  const hookTarget = webHost || `localhost:${webPort}`;
+  ensureHookSettings(hookTarget, botName);
 
   const bridge = new FeishuBridge({
     feishuAppId: appId,

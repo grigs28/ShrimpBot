@@ -2,9 +2,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { logger } from '../logger.js';
 
-const HOOK_COMMAND_TEMPLATE = (port: number, botName?: string) => {
+const HOOK_COMMAND_TEMPLATE = (host: string, botName?: string) => {
   const botParam = botName ? `?bot=${encodeURIComponent(botName)}` : '';
-  return `curl -s -X POST http://localhost:${port}/api/hook${botParam} -H 'Content-Type: application/json' -d @-`;
+  const base = host.includes('://') ? host : `http://${host}`;
+  return `curl -s -X POST ${base}/api/hook${botParam} -H 'Content-Type: application/json' -d @-`;
 };
 
 const HOOK_EVENTS = ['Stop', 'Notification', 'PostToolUseFailure'] as const;
@@ -13,7 +14,7 @@ const HOOK_EVENTS = ['Stop', 'Notification', 'PostToolUseFailure'] as const;
  * 确保 .claude/settings.local.json 中包含 ShrimpBot 所需的 hook 配置
  * 保留现有配置（如 permissions），只合并/更新 hooks 部分
  */
-export function ensureHookSettings(port: number, botName?: string): void {
+export function ensureHookSettings(host: string, botName?: string): void {
   const claudeDir = path.join(process.cwd(), '.claude');
   const settingsPath = path.join(claudeDir, 'settings.local.json');
 
@@ -32,7 +33,7 @@ export function ensureHookSettings(port: number, botName?: string): void {
     }
   }
 
-  const hookCommand = HOOK_COMMAND_TEMPLATE(port, botName);
+  const hookCommand = HOOK_COMMAND_TEMPLATE(host, botName);
   const existingHooks = (settings.hooks || {}) as Record<string, unknown>;
 
   // 构建新的 hooks 配置
@@ -46,14 +47,12 @@ export function ensureHookSettings(port: number, botName?: string): void {
 
     const existing = newHooks[eventName];
     if (Array.isArray(existing)) {
-      // 检查是否已有相同命令
-      const hasShrimpBot = existing.some(
-        (e: any) => Array.isArray(e?.hooks) &&
-          e.hooks.some((h: any) => h?.command?.includes('/api/hook')),
+      // 替换已有的 shrimpbot hook（地址可能变了）
+      const filtered = existing.filter(
+        (e: any) => !(Array.isArray(e?.hooks) &&
+          e.hooks.some((h: any) => h?.command?.includes('/api/hook'))),
       );
-      if (!hasShrimpBot) {
-        newHooks[eventName] = [...existing, hookEntry];
-      }
+      newHooks[eventName] = [...filtered, hookEntry];
     } else {
       newHooks[eventName] = [hookEntry];
     }
@@ -62,5 +61,5 @@ export function ensureHookSettings(port: number, botName?: string): void {
   settings.hooks = newHooks;
 
   fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
-  logger.info('HookSettings', `Hook 配置已写入 ${settingsPath} (端口: ${port}, bot: ${botName || 'local'})`);
+  logger.info('HookSettings', `Hook 配置已写入 ${settingsPath} (host: ${host}, bot: ${botName || 'local'})`);
 }
