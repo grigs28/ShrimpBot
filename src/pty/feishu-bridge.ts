@@ -49,6 +49,8 @@ export class FeishuBridge {
   private passthrough = false;
   private streamBuffer = '';
   private completionHandled = false;
+  /** 流式阶段已发送权限确认卡片，防止重复 */
+  private permissionNotified = false;
   /** PTY ❯ 已出现（Claude 空闲），等待 Stop hook 带 transcript 完成卡片 */
   private ptyReady = false;
   /** PTY 完成时的兜底内容（Hook Stop 未触发时使用） */
@@ -151,10 +153,31 @@ export class FeishuBridge {
         this.handleClaudeResponse(event.text, event.isComplete, event.isYesNo);
       } else if (event.type === 'question') {
         this.handleQuestion(event.options);
+      } else if (event.type === 'error') {
+        const targetChatId = this.responseChatId || this.defaultChatId;
+        if (targetChatId) {
+          const msg = `🔴 PTY 崩溃恢复失败\n${event.error.message}\nBot 已停止响应，请重新启动 sbot`;
+          if (this.config.clone) {
+            this.enqueueSend(targetChatId, msg, false, 'PTY错误');
+          } else {
+            this.sendIndependentCard(targetChatId, 'red', '🔴 PTY 错误', event.error.message);
+          }
+        }
+        logger.error(this.tag, `PTY 错误: ${event.error.message}`);
       } else if (event.type === 'exit') {
+        const targetChatId = this.responseChatId || this.defaultChatId;
+        if (targetChatId) {
+          const msg = `🔴 Claude 进程已退出（code=${event.code}）\nBot 正在关闭，请重新启动 sbot`;
+          if (this.config.clone) {
+            this.enqueueSend(targetChatId, msg, false, 'PTY退出');
+          } else {
+            this.sendIndependentCard(targetChatId, 'red', '🔴 进程退出', `Claude 进程已退出（code=${event.code}），请重新启动 sbot`);
+          }
+        }
         logger.info(this.tag, `Claude PTY 退出: code=${event.code}，关闭 Bridge`);
         this.stop();
-        process.exit(event.code || 0);
+        // 给飞书发送留 2s 时间再退出
+        setTimeout(() => process.exit(event.code || 0), 2000);
       }
     });
   }
@@ -365,6 +388,7 @@ export class FeishuBridge {
     this.defaultChatId = event.chatId;
     this.lastUserMessage = text;
     this.completionHandled = false;
+    this.permissionNotified = false;
     this.ptyReady = false;
     this.notificationSent = false;
     this.streamBuffer = '';
@@ -393,6 +417,15 @@ export class FeishuBridge {
     this.busyTimer = setTimeout(() => {
       if (this.claudeBusy) {
         logger.warn(this.tag, '⏰ 响应超时（120s），强制解除 claudeBusy');
+        const targetChatId = this.responseChatId || this.defaultChatId;
+        if (targetChatId) {
+          const msg = '⏰ 响应超时（120秒），已自动解除阻塞。\n可能原因：Claude 进程卡住或回复过长。';
+          if (this.config.clone) {
+            this.enqueueSend(targetChatId, msg, false, '超时警告');
+          } else {
+            this.sendIndependentCard(targetChatId, 'yellow', '⏰ 响应超时', '已自动解除阻塞。可能原因：Claude 进程卡住或回复过长。');
+          }
+        }
         this.processQueue();
       }
     }, 120_000);
@@ -416,6 +449,7 @@ export class FeishuBridge {
 
     // 重置状态
     this.completionHandled = false;
+    this.permissionNotified = false;
     this.ptyReady = false;
     this.notificationSent = false;
     this.streamBuffer = '';
@@ -480,6 +514,46 @@ export class FeishuBridge {
         this.streamBuffer = bufferText || text;
         // 流式更新 fallbackPtyText，确保 Stop hook 在完成前触发时也有当前轮内容
         this.fallbackPtyText = text;
+
+        // 权限确认 / 编号选项：流式阶段检测到就立即发飞书，不等 ❯
+        if (!this.waitingForAnswer && !this.permissionNotified) {
+          const isYesNoQ = this.isYesNoQuestion(this.streamBuffer);
+          const hasOpts = this.containsNumberedOptions(this.streamBuffer);
+          if (isYesNoQ || hasOpts) {
+            this.permissionNotified = true;
+            this.waitingForAnswer = true;
+            if (isYesNoQ && !hasOpts && this.config.autoApprove !== false) {
+              // yes/no 且非危险操作 → 自动通过
+              const isDangerous = FeishuBridge.DANGEROUS_PATTERNS.some(p => p.test(this.streamBuffer));
+              if (!isDangerous) {
+                this.permissionNotified = false;
+                this.waitingForAnswer = false;
+                const approveMsg = `[自动通过] ${this.streamBuffer.slice(0, 200)}\n→ 已自动回复 yes`;
+                if (this.config.clone) {
+                  this.enqueueSend(targetChatId, approveMsg, true, '自动通过');
+                } else {
+                  this.patchCard('green', '🟢 自动通过', approveMsg);
+                }
+                setTimeout(() => { if (this.pty.isRunning()) this.pty.send('yes'); }, 500);
+                return;
+              }
+              // 危险操作 → 发红色卡片等确认
+              this.patchCard('red', '🔴 危险操作', `⚠️ 需要手动确认：\n${this.streamBuffer}`);
+            } else if (isYesNoQ) {
+              this.patchCard('yellow', '🟡 需要确认', this.streamBuffer);
+            } else {
+              const optionLines = this.streamBuffer.split('\n')
+                .filter(l => /\d{1,2}[.)]\s+/.test(l.replace(/^\|\s*/, '').replace(/\s*\|$/, '')))
+                .map(l => l.replace(/^\|\s*/, '').replace(/\s*\|$/, '').trim());
+              if (optionLines.length >= 2) {
+                this.patchCard('yellow', '🟡 请选择', `📋 请回复编号选择：\n${optionLines.join('\n')}`);
+              }
+            }
+            if (!this.passthrough) {
+              fs.writeSync(2, `\x1b[33m⏳ 等待飞书回复确认...\x1b[0m\n`);
+            }
+          }
+        }
       }
       return;
     }
@@ -538,7 +612,28 @@ export class FeishuBridge {
         this.enqueueSend(targetChatId, fullText, true, `完成: ${fullText.length}字`);
       }
     } else {
-      // 非 clone 模式：❯ 只标记 PTY 就绪，等 Stop hook 带 transcript 完成卡片
+      // 非 clone 模式：检测是否是 yes/no 或编号选项，需要发飞书
+      const isYesNoQ = this.isYesNoQuestion(fullText);
+      const hasOptions = this.containsNumberedOptions(fullText);
+      if (isYesNoQ || hasOptions) {
+        // yes/no 或编号选项 → 直接发飞书卡片，等用户回复
+        this.completionHandled = true;
+        this.waitingForAnswer = true;
+        if (isYesNoQ) {
+          this.patchCard('yellow', '🟡 需要确认', fullText);
+        } else {
+          const optionLines = fullText.split('\n')
+            .filter(l => /^\s*\d{1,2}[.)]\s+/.test(l) || /^\s*[(（]\d{1,2}[)）]\s+/.test(l))
+            .map(l => l.trim());
+          const message = `📋 请回复编号选择：\n${optionLines.join('\n')}`;
+          this.patchCard('yellow', '🟡 请选择', message);
+        }
+        if (!this.passthrough) {
+          fs.writeSync(2, `\x1b[33m⏳ 等待飞书回复确认...\x1b[0m\n`);
+        }
+        return;
+      }
+      // 普通 ❯：标记 PTY 就绪，等 Stop hook 带 transcript 完成卡片
       this.ptyReady = true;
       this.fallbackPtyText = fullText;
       logger.info(this.tag, `PTY ❯ 就绪 (${fullText.length}字), 等 Stop hook`);
@@ -1017,6 +1112,23 @@ export class FeishuBridge {
         this.sendIndependentCard(targetChatId, 'red', `❌ 工具失败: ${toolName}`, content);
         break;
       }
+      case 'PostToolUse': {
+        const toolName = event.tool_name || 'unknown';
+        // 只通知关键工具，减少噪音
+        const importantTools = ['Bash', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit'];
+        if (importantTools.some(t => toolName.toLowerCase().includes(t.toLowerCase()))) {
+          const input = event.tool_input ? JSON.stringify(event.tool_input).slice(0, 200) : '';
+          const content = input || `工具 ${toolName} 执行成功`;
+          this.patchCard('blue', '🔄 处理中', `✅ ${toolName}: ${content}`, true);
+        }
+        break;
+      }
+      case 'SubagentStop': {
+        const agentId = event.agent_id || '';
+        const content = agentId ? `子代理 ${agentId.slice(0, 8)} 已完成` : '子代理已完成';
+        this.patchCard('blue', '🔄 处理中', content, true);
+        break;
+      }
     }
   }
 
@@ -1112,14 +1224,23 @@ export class FeishuBridge {
   // ========== 检测方法 ==========
 
   private isYesNoQuestion(text: string): boolean {
-    const PERM_PATTERNS = [/requires approval/i, /do you want/i, /proceed/i,
-      /\?\s*\[y\/n\]/i, /\?\s*\[Y\/n\]/, /\(yes\/no\)/i, /\(y\/n\)/i];
-    const hasPrompt = PERM_PATTERNS.some(p => p.test(text));
-    if (!hasPrompt) return false;
-    const hasYes = /\byes\b/i.test(text);
-    const hasNo = /\bno\b/i.test(text);
-    const hasAlways = /\balways\b/i.test(text) || /don'?t ask/i.test(text);
-    return (hasYes && hasNo) || hasAlways;
+    // 权限确认提示（Claude Code 新版格式）
+    if (/needs?\s+your\s+permission/i.test(text)) return true;
+    if (/allow\s+(this\s+)?tool/i.test(text)) return true;
+    if (/bypass permissions/i.test(text)) return true;
+    // 传统 yes/no 格式
+    if (/\?\s*\[y\/n\]/i.test(text)) return true;
+    if (/\(yes\/no\)/i.test(text)) return true;
+    if (/\(y\/n\)/i.test(text)) return true;
+    // 其他确认格式
+    const PERM_PATTERNS = [/requires approval/i, /do you want/i, /proceed/i];
+    if (PERM_PATTERNS.some(p => p.test(text))) {
+      const hasYes = /\byes\b/i.test(text);
+      const hasNo = /\bno\b/i.test(text);
+      const hasAlways = /\balways\b/i.test(text) || /don'?t ask/i.test(text);
+      return (hasYes && hasNo) || hasAlways;
+    }
+    return false;
   }
 
   private looksLikeQuestion(text: string): boolean {
@@ -1130,7 +1251,9 @@ export class FeishuBridge {
     const lines = text.split('\n');
     let count = 0;
     for (const line of lines) {
-      if (/^\s*\d{1,2}[.)]\s+/.test(line) || /^\s*[(（]\d{1,2}[)）]\s+/.test(line)) count++;
+      // 匹配 "1. xxx" 或 "(1) xxx" 或 markdown 表格行 "| 1. xxx |"
+      const cleaned = line.replace(/^\|\s*/, '').replace(/\s*\|$/, '').trim();
+      if (/^\d{1,2}[.)]\s+/.test(cleaned) || /^[(（]\d{1,2}[)）]\s+/.test(cleaned)) count++;
     }
     return count >= 2;
   }

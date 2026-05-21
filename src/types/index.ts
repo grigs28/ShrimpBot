@@ -55,7 +55,7 @@ export interface FeishuEvent {
 
 // Claude Code Hook 事件
 export interface HookEvent {
-  hook_event_name: 'Stop' | 'Notification' | 'PostToolUseFailure' | 'PostToolUse' | 'PreToolUse';
+  hook_event_name: 'Stop' | 'Notification' | 'PostToolUseFailure' | 'PostToolUse' | 'PreToolUse' | 'SubagentStop';
   session_id?: string;
   cwd?: string;
   transcript_path?: string;
@@ -73,4 +73,7 @@ export interface HookEvent {
   tool_input?: Record<string, unknown>;
   tool_response?: Record<string, unknown>;
   error?: string;
+  // SubagentStop
+  agent_id?: string;
+  agent_transcript_path?: string;
 }

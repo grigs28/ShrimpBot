@@ -219,8 +219,9 @@ async function startWebOnlyMode(): Promise<void> {
     ...claudeExtraArgs,
   ];
 
-  // 写入 hook 配置
-  ensureHookSettings(`localhost:${webPort}`);
+  // 写入 hook 配置（带 botName，防止多 bot 共享 WebServer 时消息串扰）
+  const localBotName = process.env.FEISHU_BOT_NAME || 'ShrimpBot';
+  ensureHookSettings(`localhost:${webPort}`, localBotName);
 
   const pty = new PTYManager({
     claudePath: process.env.CLAUDE_PATH,

@@ -249,12 +249,9 @@ export class WebServer {
           logger.warn(this.tag, `Hook 路由失败: bot "${botName}" 未连接`);
         }
       } else {
-        for (const [, ws] of this.botConnections) {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'hook', event }));
-            forwardedToRemote = true;
-          }
-        }
+        // 无 bot 参数：不广播给远端 bot，只走本地处理
+        // 防止多 bot 共享 WebServer 时消息串扰
+        logger.info(this.tag, `Hook 无 bot 参数，仅本地处理`);
       }
       // 仅当未转发给远端 bot 时才本地处理，避免双重触发 doFinalPatch
       if (!forwardedToRemote && this.deps.onHookEvent) {
@@ -1059,6 +1056,7 @@ export class WebServer {
         theme: { background: '#1a1a2e', foreground: '#e0e0e0', cursor: '#e94560', selectionBackground: '#0f3460' },
         fontFamily: '"JetBrains Mono","Fira Code",Menlo,Monaco,monospace',
         fontSize: 14, cursorBlink: true, scrollback: 5000, cols: 120, rows: 40,
+        windowsMode: true, convertEol: true,
       });
       var f = new FitAddon.FitAddon();
       t.loadAddon(f);
@@ -1135,7 +1133,16 @@ export class WebServer {
             return;
           }
           if (m.type === 'pty-data' && m.botName) {
-            mkTerm(m.botName).term.write(m.data);
+            // ConPTY 产生大量光标定位序列，WebSocket 分片会导致 xterm.js 解析错乱
+            // 用缓冲合并短时间内的多个数据块，确保 ANSI 序列完整
+            var entry = mkTerm(m.botName);
+            if (!entry._buf) { entry._buf = ''; entry._bufTimer = null; }
+            entry._buf += m.data;
+            if (entry._bufTimer) clearTimeout(entry._bufTimer);
+            entry._bufTimer = setTimeout(function() {
+              if (entry._buf) { entry.term.write(entry._buf); entry._buf = ''; }
+              entry._bufTimer = null;
+            }, 16);  // ~60fps，合并一帧内的数据
           } else if (m.type === 'bot-list') {
             setTabs(m.bots);
           }

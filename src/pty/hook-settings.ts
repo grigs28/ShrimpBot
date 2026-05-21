@@ -8,15 +8,36 @@ const HOOK_COMMAND_TEMPLATE = (host: string, botName?: string) => {
   return `curl -s -X POST ${base}/api/hook${botParam} -H 'Content-Type: application/json' -d @-`;
 };
 
-const HOOK_EVENTS = ['Stop', 'Notification', 'PostToolUseFailure'] as const;
+const HOOK_EVENTS = ['Stop', 'Notification', 'PostToolUseFailure', 'PostToolUse', 'SubagentStop'] as const;
+
+/**
+ * 从 .sbot 文件读取 FEISHU_BOT_NAME
+ */
+function readBotNameFromSbot(): string | undefined {
+  const sbotPath = path.join(process.cwd(), '.sbot');
+  if (!fs.existsSync(sbotPath)) return undefined;
+  try {
+    const content = fs.readFileSync(sbotPath, 'utf-8');
+    for (const line of content.split('\n')) {
+      if (line.trim().startsWith('FEISHU_BOT_NAME=')) {
+        return line.trim().slice('FEISHU_BOT_NAME='.length).trim() || undefined;
+      }
+    }
+  } catch { /* ignore */ }
+  return undefined;
+}
 
 /**
  * 确保 .claude/settings.local.json 中包含 ShrimpBot 所需的 hook 配置
  * 保留现有配置（如 permissions），只合并/更新 hooks 部分
+ * botName 优先级：参数 > 环境变量 > .sbot 文件
  */
 export function ensureHookSettings(host: string, botName?: string): void {
   const claudeDir = path.join(process.cwd(), '.claude');
   const settingsPath = path.join(claudeDir, 'settings.local.json');
+
+  // botName 优先级：参数 > 环境变量 > .sbot 文件
+  const resolvedBotName = botName || process.env.FEISHU_BOT_NAME || readBotNameFromSbot();
 
   // 确保目录存在
   if (!fs.existsSync(claudeDir)) {
@@ -33,7 +54,7 @@ export function ensureHookSettings(host: string, botName?: string): void {
     }
   }
 
-  const hookCommand = HOOK_COMMAND_TEMPLATE(host, botName);
+  const hookCommand = HOOK_COMMAND_TEMPLATE(host, resolvedBotName);
   const existingHooks = (settings.hooks || {}) as Record<string, unknown>;
 
   // 构建新的 hooks 配置
@@ -61,5 +82,5 @@ export function ensureHookSettings(host: string, botName?: string): void {
   settings.hooks = newHooks;
 
   fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
-  logger.info('HookSettings', `Hook 配置已写入 ${settingsPath} (host: ${host}, bot: ${botName || 'local'})`);
+  logger.info('HookSettings', `Hook 配置已写入 ${settingsPath} (host: ${host}, bot: ${resolvedBotName || 'local'})`);
 }
