@@ -114,10 +114,23 @@ export class WebServer {
   }
 
   /** 认证中间件：需要管理员登录 */
-  private requireAuth = (req: express.Request, res: express.Response, next: express.NextFunction): void => {
+  private requireAuth = async (req: express.Request, res: express.Response, next: express.NextFunction): Promise<void> => {
     if (this.noAuth) {
       // noAuth 模式跳过所有认证，直接放行
       next();
+      return;
+    }
+    // SSO ticket 回调：ticket 可能带在任意受保护路径（如应用 callback 为根路径 /）
+    const ticket = req.query.ticket as string | undefined;
+    if (ticket) {
+      const user = await this.verifyTicket(ticket);
+      if (!user) {
+        res.status(403).send('登录失败: ticket 无效或已过期');
+        return;
+      }
+      req.session.user = user;
+      // 清 ticket query 重定向，重新渲染页面
+      res.redirect(req.path);
       return;
     }
     if (!req.session?.user) {
@@ -131,6 +144,34 @@ export class WebServer {
     }
     next();
   };
+
+  /** 用 yz-login ticket 验证并返回本地用户（含角色），失败返回 null */
+  private async verifyTicket(ticket: string): Promise<{ id: number; username: string; display_name: string; role: 'user' | 'admin' } | null> {
+    try {
+      const verifyUrl = `${this.yzLoginUrl}/api/ticket/verify?ticket=${encodeURIComponent(ticket)}`;
+      const resp = await fetch(verifyUrl);
+      const data = await resp.json() as any;
+      if (!data.ok) {
+        logger.warn(this.tag, `ticket 验证失败: ${data.msg}`);
+        return null;
+      }
+      const localUser = upsertUser({
+        id: data.id,
+        username: data.username,
+        display_name: data.display_name || data.username,
+      });
+      logger.info(this.tag, `用户登录: ${data.username} (role=${localUser.role})`);
+      return {
+        id: data.id,
+        username: data.username,
+        display_name: data.display_name || data.username,
+        role: localUser.role,
+      };
+    } catch (err: any) {
+      logger.error(this.tag, `ticket 验证异常: ${err.message}`);
+      return null;
+    }
+  }
 
   /** 管理员中间件（已由 requireAuth 保证，这里做双重检查） */
   private requireAdmin = (req: express.Request, res: express.Response, next: express.NextFunction): void => {
@@ -158,45 +199,20 @@ export class WebServer {
       res.redirect(`${this.yzLoginUrl}/login?from=${encodeURIComponent(from)}`);
     });
 
-    // yz-login 回调：验证 ticket
+    // yz-login 回调：验证 ticket（/callback 显式路由；ticket 也可能带在根路径 / 上，由 requireAuth 处理）
     this.app.get('/callback', async (req, res) => {
       const ticket = req.query.ticket as string;
       if (!ticket) {
         res.status(400).send('缺少 ticket');
         return;
       }
-
-      try {
-        const verifyUrl = `${this.yzLoginUrl}/api/ticket/verify?ticket=${encodeURIComponent(ticket)}`;
-        const resp = await fetch(verifyUrl);
-        const data = await resp.json() as any;
-
-        if (!data.ok) {
-          logger.warn(this.tag, `ticket 验证失败: ${data.msg}`);
-          res.status(403).send(`登录失败: ${data.msg || '验证失败'}`);
-          return;
-        }
-
-        // 记录/更新用户到本地，获取角色（完全忽略 SSO 的 is_admin）
-        const localUser = upsertUser({
-          id: data.id,
-          username: data.username,
-          display_name: data.display_name || data.username,
-        });
-
-        req.session.user = {
-          id: data.id,
-          username: data.username,
-          display_name: data.display_name || data.username,
-          role: localUser.role,
-        };
-
-        logger.info(this.tag, `用户登录: ${data.username} (role=${localUser.role})`);
-        res.redirect('/');
-      } catch (err: any) {
-        logger.error(this.tag, `ticket 验证异常: ${err.message}`);
-        res.status(500).send('登录服务异常');
+      const user = await this.verifyTicket(ticket);
+      if (!user) {
+        res.status(403).send('登录失败: ticket 无效或已过期');
+        return;
       }
+      req.session.user = user;
+      res.redirect('/');
     });
 
     // 登出
