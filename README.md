@@ -4,17 +4,21 @@
 
 支持**多群聊**和**单人私聊**同时工作，自动发现新会话并记录。
 
-> **要求**：Claude Code ≥ v2.1.47（Stop hook 需 `last_assistant_message` 字段）
-> **版本**：v1.1.0 — 引入 Claude Agent SDK 架构升级（SDK_EVENT_MODE feature flag），PTY 路径完全兼容
+> **要求**：
+> - Claude Code CLI ≥ v2.1.47（PTY 与 SDK 模式均需 `claude` 在 PATH；SDK 模式 spawn claude 子进程）
+> - Linux/macOS：`npm install` 需 `python3 make g++`（编译 node-pty）
+> **版本**：v1.1.0 — 引入 Claude Agent SDK 架构升级（`SDK_EVENT_MODE` feature flag），PTY 路径完全兼容
 
 ## 快速开始 / Quick Start
+
+**前置**：[Node.js](https://nodejs.org/) 20+、[Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)（`claude` 在 PATH）。Linux/macOS 还需 `python3 make g++`（编译 node-pty）。
 
 ```bash
 npm install && npm run build
 sbot
 ```
 
-无参数启动 = 全功能：自动检测端口、加载配置、启动三端。
+无参数启动 = 全功能（bridge 模式）：自动检测端口、加载配置、启动 PTY + 飞书 + Web 三端。
 
 首次启动或空项目目录自动进入配置向导（选择哪只咪）。也可以用 `sbot init` 手动初始化：
 
@@ -115,11 +119,14 @@ Claude 选项（全部透传给 Claude Code CLI）:
 
 ## 模式说明 / Modes
 
-| 模式 | 飞书消息 | 说明 |
-|------|----------|------|
-| **默认** | 交互式卡片 | 任务开始 → 🔵思考中，完成 → 🟢卡片更新，错误 → 🔴 |
-| `--clone` | 纯文本全量 | 所有完整回复都发飞书，原样发送 |
-| `--web-server` | 无 | 独立 Web 服务，供 sbot 连接 |
+| 模式 | 触发 | 飞书 | 说明 |
+|------|------|------|------|
+| **bridge**（默认） | `FEISHU_MODE=bridge` 或有飞书凭证 | ✅ | 完整三端：PTY + 飞书 + Web。卡片 🔵思考→🟢完成/🔴错误 |
+| `--clone` | bridge + `--clone` | ✅ 纯文本 | 所有回复原样发飞书（非卡片） |
+| **SDK** | bridge + `SDK_EVENT_MODE=true` | ✅ | 飞书走 Agent SDK 结构化事件（替代 PTY 正则解析），终端仍 PTY |
+| **web-server** | `--web-server` | ❌ | 独立 WebServer hub（仅 Web UI + Hook API），各 sbot `--web-host` 连接 |
+| **web-only** | `--web`（无飞书凭证） | ❌ | PTY + Web 终端，无飞书 |
+| single/master | `FEISHU_MODE=single/master` | — | 旧模式（deprecated，勿用） |
 
 ## Claude Hooks 集成
 
@@ -129,19 +136,25 @@ Claude 选项（全部透传给 Claude Code CLI）:
 |-----------|------|
 | `Stop` | 任务完成，更新飞书卡片 |
 | `Notification` | Claude 主动通知用户 |
+| `PostToolUse` | 工具调用成功（Bash/Write/Edit 等发"🔄 处理中"中间态） |
 | `PostToolUseFailure` | 工具调用出错 |
+| `SubagentStop` | 子代理完成（发"🔄 处理中"中间态） |
 
 ## 架构 / Architecture
 
 ```
-飞书(多群+私聊) ←WSClient→ FeishuBridge ←PTY→ Claude Code
-终端 Terminal ←stdin/stdout→ FeishuBridge ←PTY→ Claude Code
+# bridge 模式（单实例全功能）
+飞书(多群+私聊) ←WSClient→ FeishuBridge ←PTY/SDK→ Claude Code
+终端 Terminal ←stdin/stdout→ FeishuBridge
 Web Browser ←WebSocket→ WebServer ←→ FeishuBridge
 
-Claude Code Hooks (Stop/Notification/Failure)
+Claude Code Hooks (Stop/Notification/PostToolUse/PostToolUseFailure/SubagentStop)
   └── curl POST /api/hook → WebServer → FeishuBridge → 飞书
 
-sbot ←WebSocket(/ws/bot)→ 独立 WebServer (systemd)
+# 多咪架构（Docker web-server hub + 各 sbot 连接）
+Docker web-server (:5554, 仅 Web UI + Hook API)
+  ├── /ws/bot ← sbot (Code咪) --web-host  — PTY + 飞书 + SDK
+  └── /ws/bot ← sbot (其他咪) --web-host  — PTY + 飞书
 ```
 
 ## 飞书权限 / Feishu Permissions
@@ -174,6 +187,31 @@ sudo systemctl enable --now sbot-web
 
 # 手动 sbot 时自动连上去（三端同步）
 sbot
+```
+
+## Docker 部署（WebServer hub）
+
+生产推荐：Docker 跑 `--web-server` 模式当 hub，各 sbot 实例 `--web-host` 连接（多咪架构）。
+
+```bash
+# 本机构建镜像（无外网的生产机需本机 build 后传）
+npm run build                              # 先编译 dist
+docker build -t shrimpbot:v1.1.0 .
+docker save shrimpbot:v1.1.0 | gzip | ssh user@prod 'gunzip | docker load'
+
+# 生产机启动（docker-compose.yml 见仓库根目录）
+docker compose up -d
+```
+
+`docker-compose.yml` 关键点：
+- `CMD node dist/index.js --web-server`（hub 模式，不启动 PTY/飞书）
+- `YZ_LOGIN_URL` / `YZ_LOGIN_APP_ID`（Web SSO）
+- 挂载 `~/.shrimpbot`（users.json/settings.json）
+- **不需** claude CLI / 飞书凭证 / SDK_EVENT_MODE（hub 不启动 PTY）
+
+各 sbot 实例连接 hub：
+```bash
+sbot --web-host 192.168.0.18:5554   # 本机/其他机跑 bridge，连 Docker hub
 ```
 
 ## 日志 / Logs
