@@ -1,6 +1,7 @@
 import * as http from 'http';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import express from 'express';
 import session from 'express-session';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -105,12 +106,25 @@ export class WebServer {
   }
 
   private setupSession(): void {
+    const settings = loadWebSettings();
+    let secret = settings.session_secret || this.deps.sessionSecret;
+    if (!secret) {
+      // 生成随机 secret 并持久化，避免硬编码默认 + 重启不变（session 失效）
+      secret = crypto.randomBytes(32).toString('hex');
+      saveWebSettings({ session_secret: secret });
+      logger.info(this.tag, '已生成随机 session_secret 并持久化到 settings.json');
+    }
     this.app.use(session({
-      secret: this.deps.sessionSecret || 'sbot-session-secret',
+      secret,
       resave: false,
       saveUninitialized: false,
       cookie: { maxAge: 24 * 60 * 60 * 1000 }, // 24h
     }));
+  }
+
+  /** 动态获取 yz-login 地址（settings.json 优先 > env > 默认），/settings 页面修改实时生效 */
+  private getYzLoginUrl(): string {
+    return loadWebSettings().yz_login_url || this.deps.yzLoginUrl || process.env.YZ_LOGIN_URL || 'http://192.168.0.8';
   }
 
   /** 认证中间件：需要管理员登录 */
@@ -196,7 +210,7 @@ export class WebServer {
       const from = process.env.YZ_LOGIN_APP_ID
         ? `id:${process.env.YZ_LOGIN_APP_ID}`
         : `${this.serviceUrl}/callback`;
-      res.redirect(`${this.yzLoginUrl}/login?from=${encodeURIComponent(from)}`);
+      res.redirect(`${this.getYzLoginUrl()}/login?from=${encodeURIComponent(from)}`);
     });
 
     // yz-login 回调：验证 ticket（/callback 显式路由；ticket 也可能带在根路径 / 上，由 requireAuth 处理）
@@ -215,14 +229,14 @@ export class WebServer {
       res.redirect('/');
     });
 
-    // 登出
+    // 登出：跳 yz-login /logout 清除 SSO 会话（否则已登录态会立刻重新发 ticket 回来，登出无效）
     this.app.get('/logout', (req, res) => {
       const username = req.session?.user?.username;
       req.session?.destroy(() => {});
       const from = process.env.YZ_LOGIN_APP_ID
         ? `id:${process.env.YZ_LOGIN_APP_ID}`
         : `${this.serviceUrl}/callback`;
-      res.redirect(`${this.yzLoginUrl}/login?from=${encodeURIComponent(from)}`);
+      res.redirect(`${this.getYzLoginUrl()}/logout?from=${encodeURIComponent(from)}`);
       logger.info(this.tag, `用户登出: ${username}`);
     });
 
