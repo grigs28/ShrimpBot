@@ -77,3 +77,6 @@ export interface HookEvent {
   agent_id?: string;
   agent_transcript_path?: string;
 }
+
+// SDK 桥内类型
+export type { SDKBridgeEvent, ApprovalRequest, PermissionResult } from '../sdk/sdk-types.js';
