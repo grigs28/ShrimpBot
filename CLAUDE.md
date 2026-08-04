@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ShrimpBot is a Feishu (Lark) ↔ Claude Code real-time bridge. It spawns Claude Code via PTY and synchronizes I/O across three endpoints: terminal (TUI passthrough), Feishu (interactive cards), and Web (browser terminal via WebSocket).
 
+> **Requirement:** Claude Code CLI ≥ v2.1.47 — the `Stop` hook relies on the `last_assistant_message` field, which was added in this version. The E2E test assumes the CLI is installed at `/home/grigs/.local/bin/claude`.
+
 ## Build & Development Commands
 
 ```bash
@@ -22,8 +24,8 @@ npm run test:e2e    # vitest run src/pty/__tests__/e2e-pty.test.ts
 
 Parses CLI args, loads config, and dispatches to one of four modes:
 
-- **Bridge mode** (`FEISHU_MODE=bridge`, default when `.sbot` exists): `FeishuBridge` — PTY + Feishu WSClient + Web terminal
-- **Single mode** (`FEISHU_MODE=single`): Legacy `MCPServer` via stdio (deprecated in practice)
+- **Bridge mode** (`FEISHU_MODE=bridge`, the default once `sbot init` has written `.sbot`): `FeishuBridge` — PTY + Feishu WSClient + Web terminal. This is the main, supported path.
+- **Single mode** (bare default when `FEISHU_MODE` is unset): Legacy `MCPServer` (`src/server.ts`) via stdio — deprecated, do not build new features here.
 - **Master mode** (`FEISHU_MODE=master`): Multi-bot process manager (`src/master.ts`)
 - **Web-only mode** (`--web` without Feishu creds): PTY + Web terminal, no Feishu
 - **Standalone Web server** (`--web-server`): Only Web UI + Hook API, no PTY/Feishu
@@ -39,6 +41,8 @@ Parses CLI args, loads config, and dispatches to one of four modes:
 | `src/pty/hook-settings.ts` | Auto-writes `.claude/settings.local.json` hook config so Claude Code emits `Stop`/`Notification`/`PostToolUseFailure` events to `POST /api/hook`. |
 | `src/config.ts` | Config loader. Reads `~/.shrimpbot/bots.json` (all bot creds), `~/.shrimpbot/config.json` (active bot + chatIds), and `.sbot` (project-level env vars). |
 | `src/setup.ts` | Interactive `sbot init` wizard. Lets user select/register bots and choose Feishu chats. |
+
+**Where the complexity lives:** `feishu-bridge.ts` (~1400 lines) and `web-server.ts` (~1350 lines) hold nearly all the orchestration and three-endpoint sync logic. When debugging data-flow or card state, start here. The PTY itself is spawned via `claude --dangerously-skip-permissions`; the binary is resolved from `CLAUDE_PATH` env (default `claude`, with special Windows `.cmd`/`claude.exe` resolution in `pty-manager.ts`).
 
 ### Config Hierarchy (highest to lowest priority)
 
@@ -113,6 +117,13 @@ Claude Code hooks (`Stop`, `Notification`, `PostToolUseFailure`) POST to `/api/h
 - Dangerous patterns (`rm -rf`, `drop table`, etc.) block auto-approval even for yes/no questions.
 
 ## Testing
+
+```bash
+npm test                              # vitest run, excludes e2e
+npm run test:e2e                      # e2e only (spawns real claude PTY)
+npx vitest run src/pty/__tests__/output-parser.test.ts   # one test file
+npx vitest run -t "detects yes/no"                       # one test by name
+```
 
 - Unit tests: `src/pty/__tests__/output-parser.test.ts` — tests parser noise filtering, completion detection, yes/no detection.
 - E2E test: `src/pty/__tests__/e2e-pty.test.ts` — spawns real `claude` PTY, sends a message, verifies response extraction. Requires Claude Code CLI installed at `/home/grigs/.local/bin/claude`.
