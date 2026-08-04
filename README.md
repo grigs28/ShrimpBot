@@ -5,6 +5,7 @@
 支持**多群聊**和**单人私聊**同时工作，自动发现新会话并记录。
 
 > **要求**：Claude Code ≥ v2.1.47（Stop hook 需 `last_assistant_message` 字段）
+> **版本**：v1.1.0 — 引入 Claude Agent SDK 架构升级（SDK_EVENT_MODE feature flag），PTY 路径完全兼容
 
 ## 快速开始 / Quick Start
 
