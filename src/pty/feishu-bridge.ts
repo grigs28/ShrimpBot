@@ -9,7 +9,7 @@ import { addChatId, loadShrimpBotConfig } from '../config.js';
 import type { FeishuEvent, HookEvent } from '../types/index.js';
 import { SDKSession } from '../sdk/sdk-session.js';
 import { FeishuCardRenderer } from '../sdk/feishu-card-renderer.js';
-import type { ApprovalRequest, PermissionResult } from '../sdk/sdk-types.js';
+import type { SDKBridgeEvent, ApprovalRequest, PermissionResult } from '../sdk/sdk-types.js';
 
 export interface BridgeConfig {
   feishuAppId: string;
@@ -111,6 +111,8 @@ export class FeishuBridge {
   private sdkRenderer: FeishuCardRenderer | null = null;
   /** 是否启用 SDK 模式（SDK_EVENT_MODE === 'true'） */
   private sdkMode: boolean = false;
+  /** 方案 C：SDK 模式下 Web 广播回调（SDK 事件 → Web xterm，替代 PTY raw） */
+  private sdkWebBroadcast: ((data: string) => void) | null = null;
 
   private static readonly DANGEROUS_PATTERNS = [
     /rm\s+-rf/i, /rm\s+-r\s+/i, /drop\s+table/i, /delete\s+from/i,
@@ -139,7 +141,15 @@ export class FeishuBridge {
 
     // Web 终端服务
     this.webServer = new WebServer({
-      onPtyData: (cb) => { this.pty.onRawData(cb); },
+      onPtyData: (cb) => {
+        // 方案 C：SDK 模式 Web 显示 SDK 事件（非 PTY raw），cb 存为 SDK 广播目标；
+        // PTY 模式 cb 绑 PTY raw（原行为）
+        if (this.sdkMode) {
+          this.sdkWebBroadcast = cb;
+        } else {
+          this.pty.onRawData(cb);
+        }
+      },
       ptyWrite: (data) => {
         // Web/API 真正文本输入才触发飞书转发（排除终端探针等控制序列）
         if (!this.firstMessageReceived && /[^\x00-\x1f\x7f]/.test(data)) {
@@ -408,6 +418,23 @@ export class FeishuBridge {
   // ========== SDK 模式：通过 Claude Agent SDK 派发 ==========
 
   /**
+   * 方案 C：把 SDK 事件格式化为文本广播到 Web xterm（SDK 模式 Web 显示 SDK 事件，非 PTY raw）。
+   * 飞书 + Web 同一 SDK claude，实时同步。
+   */
+  private broadcastSdkToWeb(event: SDKBridgeEvent): void {
+    if (!this.sdkWebBroadcast) return;
+    let text = '';
+    switch (event.type) {
+      case 'text': text = event.text + '\r\n'; break;
+      case 'tool_use': text = `🛠 ${event.toolName}: ${JSON.stringify(event.input).slice(0, 80)}\r\n`; break;
+      case 'completed': text = (event.text || '') + '\r\n'; break;
+      case 'error': text = `🔴 ${event.message}\r\n`; break;
+      // tool_result / approval_request / init 不广播（噪声或无文本）
+    }
+    if (text) this.sdkWebBroadcast(text);
+  }
+
+  /**
    * SDK 路径派发（仅 SDK_EVENT_MODE=true 时调用）。
    * 与旧 PTY 路径并行，不经 PTYManager，直接消费 SDKSession 事件流并 patch 飞书卡片。
    * 自管理 claudeBusy 生命周期（start=true / finally=false + processQueue）。
@@ -437,6 +464,8 @@ export class FeishuBridge {
       });
 
       for await (const event of events) {
+        // 方案 C：SDK 事件广播到 Web xterm（飞书+Web 同一 SDK claude，实时同步）
+        this.broadcastSdkToWeb(event);
         if (event.type === 'completed') {
           this.sdkRenderer!.addEvent(event);
           const card = this.sdkRenderer!.finalize();
