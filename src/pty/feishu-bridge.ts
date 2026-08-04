@@ -1339,7 +1339,8 @@ export class FeishuBridge {
   }
 
   private looksLikeQuestion(text: string): boolean {
-    return /[？?]/.test(text) || /选择|选一个|选项|pick|choose|select/i.test(text);
+    // 只认"明确选择指令"或问号结尾，避免解释性文本里的"选项/选择"词被误判为选择意图
+    return /[？?]\s*$/m.test(text) || /请选择|请回复编号|选一个|选哪个|pick|choose|select/i.test(text);
   }
 
   private containsNumberedOptions(text: string): boolean {
