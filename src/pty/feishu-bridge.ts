@@ -157,6 +157,8 @@ export class FeishuBridge {
       botName: config.botName,
       cwd: config.claudeCwd,
       onHookEvent: (event) => this.handleHookEvent(event),
+      yzLoginUrl: process.env.YZ_LOGIN_URL,
+      noAuth: process.env.WEB_NO_AUTH === 'true',
     }, config.webPort || 5554);
 
     this.pty.onEvent((event) => {

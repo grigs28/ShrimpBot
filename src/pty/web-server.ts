@@ -150,10 +150,12 @@ export class WebServer {
 
     // ── 认证路由（公开） ──
 
-    // 跳转到 yz-login
+    // 跳转到 yz-login（from 支持应用 ID 引用 id:N，见 yz-login 集成指南）
     this.app.get('/login', (_req, res) => {
-      const callback = `${this.serviceUrl}/callback`;
-      res.redirect(`${this.yzLoginUrl}/login?from=${encodeURIComponent(callback)}`);
+      const from = process.env.YZ_LOGIN_APP_ID
+        ? `id:${process.env.YZ_LOGIN_APP_ID}`
+        : `${this.serviceUrl}/callback`;
+      res.redirect(`${this.yzLoginUrl}/login?from=${encodeURIComponent(from)}`);
     });
 
     // yz-login 回调：验证 ticket
@@ -201,8 +203,10 @@ export class WebServer {
     this.app.get('/logout', (req, res) => {
       const username = req.session?.user?.username;
       req.session?.destroy(() => {});
-      const callback = `${this.serviceUrl}/callback`;
-      res.redirect(`${this.yzLoginUrl}/login?from=${encodeURIComponent(callback)}`);
+      const from = process.env.YZ_LOGIN_APP_ID
+        ? `id:${process.env.YZ_LOGIN_APP_ID}`
+        : `${this.serviceUrl}/callback`;
+      res.redirect(`${this.yzLoginUrl}/login?from=${encodeURIComponent(from)}`);
       logger.info(this.tag, `用户登出: ${username}`);
     });
 

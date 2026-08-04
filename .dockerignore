@@ -1,0 +1,10 @@
+.git
+spike/
+.superpowers/
+docs/
+test-pty*.mjs
+node_modules/.cache
+node_modules/.npm
+.claude
+.sbot
+*.log
