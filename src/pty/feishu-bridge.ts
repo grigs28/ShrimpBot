@@ -7,6 +7,9 @@ import { WebServer } from './web-server.js';
 import { logger } from '../logger.js';
 import { addChatId, loadShrimpBotConfig } from '../config.js';
 import type { FeishuEvent, HookEvent } from '../types/index.js';
+import { SDKSession } from '../sdk/sdk-session.js';
+import { FeishuCardRenderer } from '../sdk/feishu-card-renderer.js';
+import type { ApprovalRequest, PermissionResult } from '../sdk/sdk-types.js';
 
 export interface BridgeConfig {
   feishuAppId: string;
@@ -101,6 +104,14 @@ export class FeishuBridge {
   private defaultChatId = '';
   private knownChats = new Map<string, ChatInfo>();
 
+  // ========== SDK 模式（feature flag SDK_EVENT_MODE=true） ==========
+  /** SDK 会话（封装 Claude Agent SDK 的 query/resume） */
+  private sdkSession: SDKSession | null = null;
+  /** SDK 事件 → 飞书卡片渲染器 */
+  private sdkRenderer: FeishuCardRenderer | null = null;
+  /** 是否启用 SDK 模式（SDK_EVENT_MODE === 'true'） */
+  private sdkMode: boolean = false;
+
   private static readonly DANGEROUS_PATTERNS = [
     /rm\s+-rf/i, /rm\s+-r\s+/i, /drop\s+table/i, /delete\s+from/i,
     /truncate\s+table/i, /chmod\s+777/i, /ALTER\s+TABLE.*DROP/i, /force\s+push/i,
@@ -180,6 +191,15 @@ export class FeishuBridge {
         setTimeout(() => process.exit(event.code || 0), 2000);
       }
     });
+
+    // SDK 模式初始化（feature flag：SDK_EVENT_MODE === 'true'）
+    this.sdkMode = process.env.SDK_EVENT_MODE === 'true';
+    if (this.sdkMode) {
+      const sdkCwd = this.config.claudeCwd || process.cwd();
+      this.sdkSession = new SDKSession(sdkCwd);
+      this.sdkRenderer = new FeishuCardRenderer();
+      logger.info(this.tag, `SDK 模式已启用 (cwd: ${sdkCwd})`);
+    }
   }
 
   async start(): Promise<void> {
@@ -383,7 +403,80 @@ export class FeishuBridge {
     }
   }
 
+  // ========== SDK 模式：通过 Claude Agent SDK 派发 ==========
+
+  /**
+   * SDK 路径派发（仅 SDK_EVENT_MODE=true 时调用）。
+   * 与旧 PTY 路径并行，不经 PTYManager，直接消费 SDKSession 事件流并 patch 飞书卡片。
+   * 自管理 claudeBusy 生命周期（start=true / finally=false + processQueue）。
+   */
+  private async dispatchToClaudeViaSDK(text: string, targetChatId: string): Promise<void> {
+    if (!this.sdkSession || !this.sdkRenderer) return;
+
+    this.claudeBusy = true;
+    this.responseChatId = targetChatId;
+    this.sdkRenderer.reset();
+
+    // 思考卡片（非 clone 模式才有意义，sendThinkingCard 内部已处理卡片发送）
+    if (!this.config.clone) {
+      this.sendThinkingCard(targetChatId);
+    }
+
+    try {
+      // cwd 已在 SDKSession 构造时设定，此处不再传入（SDKSessionOptions 无 cwd 字段）
+      const events = this.sdkSession.start(text, {
+        permissionMode: 'default',
+        // clone 模式不弹审批（透传），非 clone 阶段 A 直接 allow（与旧路径行为兼容）
+        // TODO: 阶段 B 接入 ApprovalGate 飞书交互卡片
+        onApproval: this.config.clone ? undefined : async (req: ApprovalRequest): Promise<PermissionResult> => {
+          logger.info(this.tag, `审批请求: ${req.toolName} ${JSON.stringify(req.input).slice(0, 100)}`);
+          return { behavior: 'allow' };
+        },
+      });
+
+      for await (const event of events) {
+        if (event.type === 'completed') {
+          this.sdkRenderer!.addEvent(event);
+          const card = this.sdkRenderer!.finalize();
+          // 终态卡片：若 renderer 未累积到文本（仅有 completed 自带 text），兜底用事件文本
+          const content = card.content || event.text;
+          this.patchCard(card.color, card.header, content);
+          break;
+        } else if (event.type === 'error') {
+          this.sdkRenderer!.addEvent(event);
+          const card = this.sdkRenderer!.finalize();
+          this.patchCard('red', '🔴 错误', card.content);
+          break;
+        } else if (event.type === 'approval_request') {
+          // 阶段 A：不渲染独立审批卡片，由 onApproval 回调直接 allow
+          // 这里不 patch 卡片，避免与 onApproval 的并发 patch 竞争
+          continue;
+        } else {
+          // 流式中间态（text / tool_use / tool_result）
+          const shouldPatch = this.sdkRenderer!.addEvent(event);
+          if (shouldPatch && !this.config.clone) {
+            const card = this.sdkRenderer!.getIntermediate();
+            this.patchCard(card.color, card.header, card.content);
+          }
+        }
+      }
+    } catch (err: any) {
+      const detail = err?.message ? String(err.message) : String(err);
+      logger.error(this.tag, `SDK dispatch 异常: ${detail}`);
+      this.patchCard('red', '🔴 错误', detail);
+    } finally {
+      this.claudeBusy = false;
+      this.processQueue();
+    }
+  }
+
   private dispatchToClaude(event: FeishuEvent, text: string): void {
+    // SDK 模式：走 Claude Agent SDK，不经 PTY（feature flag 控制）
+    if (this.sdkMode && this.sdkSession) {
+      void this.dispatchToClaudeViaSDK(text, event.chatId);
+      return;
+    }
+    // ===== 以下为旧 PTY 路径，SDK_EVENT_MODE 非 'true' 时完全不变 =====
     this.responseChatId = event.chatId;
     this.defaultChatId = event.chatId;
     this.lastUserMessage = text;
