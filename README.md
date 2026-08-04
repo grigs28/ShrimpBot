@@ -7,7 +7,7 @@
 > **要求**：
 > - Claude Code CLI ≥ v2.1.47（PTY 与 SDK 模式均需 `claude` 在 PATH；SDK 模式 spawn claude 子进程）
 > - Linux/macOS：`npm install` 需 `python3 make g++`（编译 node-pty）
-> **版本**：v1.1.0 — 引入 Claude Agent SDK 架构升级（`SDK_EVENT_MODE` feature flag），PTY 路径完全兼容
+> **版本**：v1.2.0 — Docker web-server hub 架构 + SSO yz-login 集成 + PTY 误判减少（编号选项门控/AskUserQuestion 引导）+ @所有人 兼容 SDK 1.58.0
 
 ## 快速开始 / Quick Start
 
