@@ -1343,7 +1343,11 @@ export class FeishuBridge {
   }
 
   private containsNumberedOptions(text: string): boolean {
-    const lines = text.split('\n');
+    // 门控1：必须有"选择意图"，避免把 Claude 解释性的编号列表（如步骤 1. 2. 3.）误判为选项题
+    // 仅当文本含问号或"选择/选一个/pick/choose/select"等词汇时才进一步检测编号
+    if (!this.looksLikeQuestion(text)) return false;
+    // 门控2：底部区域限定（选项总是出现在最近输出），避免历史编号行干扰
+    const lines = text.split('\n').slice(-30);
     let count = 0;
     for (const line of lines) {
       // 匹配 "1. xxx" 或 "(1) xxx" 或 markdown 表格行 "| 1. xxx |"

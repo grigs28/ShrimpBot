@@ -71,7 +71,7 @@ export class PTYManager {
     }
 
     const claudePath = resolveClaudePath(this.options.claudePath || 'claude');
-    // extraArgs 去重（防止 --dangerously-skip-permissions 重复）
+    // 暂保留 --dangerously-skip-permissions；A2 完整（PermissionRequest 审批端点 + hub 协议）落地后改 acceptEdits
     const baseArgs = ['--dangerously-skip-permissions'];
     const extraArgs = (this.options.extraArgs || []).filter(
       a => !baseArgs.includes(a)

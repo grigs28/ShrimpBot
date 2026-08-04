@@ -8,7 +8,12 @@ const HOOK_COMMAND_TEMPLATE = (host: string, botName?: string) => {
   return `curl -s -X POST ${base}/api/hook${botParam} -H 'Content-Type: application/json' -d @-`;
 };
 
-const HOOK_EVENTS = ['Stop', 'Notification', 'PostToolUseFailure', 'PostToolUse', 'SubagentStop'] as const;
+const HOOK_EVENTS = ['Stop', 'Notification', 'PostToolUseFailure', 'PostToolUse', 'SubagentStop', 'SessionStart', 'PermissionRequest'] as const;
+
+// SessionStart hook：输出 additionalContext 引导 Claude 优先用 AskUserQuestion 工具
+// （结构化选项，可被 canUseTool/hook 可靠识别），避免 TUI 纯文本编号列表（易被误判为选项题）
+const SESSION_START_ADDITIONAL_CONTEXT = '当需要让用户从多个选项中选择时，优先使用 AskUserQuestion 工具（渲染为结构化选项），而不是用纯文本编号列表（如"1. xxx 2. yyy"）提问——远程桥接端能可靠识别结构化选项。';
+const SESSION_START_COMMAND = `echo '${JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: SESSION_START_ADDITIONAL_CONTEXT } })}'  # shrimpbot`;
 
 /**
  * 从 .sbot 文件读取 FEISHU_BOT_NAME
@@ -60,18 +65,25 @@ export function ensureHookSettings(host: string, botName?: string): void {
   // 构建新的 hooks 配置
   const newHooks: Record<string, unknown> = { ...existingHooks };
 
+  const base = host.includes('://') ? host : `http://${host}`;
+  const botParam = resolvedBotName ? `?bot=${encodeURIComponent(resolvedBotName)}` : '';
   for (const eventName of HOOK_EVENTS) {
-    const hookEntry = {
-      matcher: '',
-      hooks: [{ type: 'command', command: hookCommand }],
-    };
+    let hookEntry: { matcher: string; hooks: any[] };
+    if (eventName === 'PermissionRequest') {
+      // A2 同步 HTTP hook：web-server 阻塞返回 allow/deny decision（安全自动 allow / 危险飞书审批）
+      hookEntry = { matcher: '', hooks: [{ type: 'http', url: `${base}/api/hook/approval${botParam}`, timeout: 300 }] };
+    } else if (eventName === 'SessionStart') {
+      hookEntry = { matcher: '', hooks: [{ type: 'command', command: SESSION_START_COMMAND }] };
+    } else {
+      hookEntry = { matcher: '', hooks: [{ type: 'command', command: hookCommand }] };
+    }
 
     const existing = newHooks[eventName];
     if (Array.isArray(existing)) {
-      // 替换已有的 shrimpbot hook（地址可能变了）
+      // 替换已有 shrimpbot hook（command 含 /api/hook 或 shrimpbot 标记，http url 含 /api/hook）
       const filtered = existing.filter(
         (e: any) => !(Array.isArray(e?.hooks) &&
-          e.hooks.some((h: any) => h?.command?.includes('/api/hook'))),
+          e.hooks.some((h: any) => h?.command?.includes('/api/hook') || h?.command?.includes('shrimpbot') || h?.url?.includes('/api/hook'))),
       );
       newHooks[eventName] = [...filtered, hookEntry];
     } else {
