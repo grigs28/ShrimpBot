@@ -7,7 +7,7 @@
 > **要求**：
 > - Claude Code CLI ≥ v2.1.47（PTY 与 SDK 模式均需 `claude` 在 PATH；SDK 模式 spawn claude 子进程）
 > - Linux/macOS：`npm install` 需 `python3 make g++`（编译 node-pty）
-> **版本**：v1.2.0 — Docker web-server hub 架构 + SSO yz-login 集成 + PTY 误判减少（编号选项门控/AskUserQuestion 引导）+ @所有人 兼容 SDK 1.58.0
+> **版本**：v1.3.0 — 方案 C（SDK 模式 Web 显示 SDK 事件流，飞书+Web 同一 claude 实时同步）+ Docker hub 架构 + SSO 集成 + PTY 误判减少 + @所有人 兼容
 
 ## 快速开始 / Quick Start
 
@@ -60,6 +60,18 @@ CLAUDE_CWD=/path/to/project
 | **终端** | 完整 Claude Code TUI（透传模式），键盘直接操作 |
 | **飞书** | 交互式卡片，选项选择、确认、富文本 Markdown |
 | **Web** | 浏览器终端（端口 5554），实时 WebSocket |
+
+### PTY 模式 vs SDK 模式（三端同步差异）
+
+| | PTY 模式（`SDK_EVENT_MODE=false`，默认） | SDK 模式（`SDK_EVENT_MODE=true`，方案 C） |
+|---|---|---|
+| **飞书消息走向** | PTY claude（`pty.send`） | SDK claude（`query` spawn，独立后台） |
+| **Web 显示** | PTY raw（TUI，三端同一 claude）| SDK 事件流（飞书+Web 同一 SDK claude） |
+| **Web 输入** | PTY claude（回复 Web 可见） | PTY claude（独立，回复不进 SDK 事件流） |
+| **优势** | 三端完全同步（飞书/Web/终端同一 claude）| 飞书结构化（无正则/选项误判、canUseTool 审批可期） |
+| **劣势** | 正则解析脆弱（A1 门控缓解）、`--dangerously-skip-permissions` | Web 输入与 SDK 显示通道分离（方案 C 未覆盖 Web 输入） |
+
+**选型**：要三端完全同步用 PTY（默认）；要飞书结构化 + Web 看飞书问答用 SDK（方案 C）。
 
 ### 启动逻辑
 
@@ -123,7 +135,7 @@ Claude 选项（全部透传给 Claude Code CLI）:
 |------|------|------|------|
 | **bridge**（默认） | `FEISHU_MODE=bridge` 或有飞书凭证 | ✅ | 完整三端：PTY + 飞书 + Web。卡片 🔵思考→🟢完成/🔴错误 |
 | `--clone` | bridge + `--clone` | ✅ 纯文本 | 所有回复原样发飞书（非卡片） |
-| **SDK** | bridge + `SDK_EVENT_MODE=true` | ✅ | 飞书走 Agent SDK 结构化事件（替代 PTY 正则解析），终端仍 PTY |
+| **SDK** | bridge + `SDK_EVENT_MODE=true` | ✅ | 飞书走 Agent SDK 结构化事件（替代 PTY 正则解析）。**方案 C**：Web 同步显示 SDK 事件流（飞书+Web 同一 SDK claude，实时同步）；终端 PTY 独立 |
 | **web-server** | `--web-server` | ❌ | 独立 WebServer hub（仅 Web UI + Hook API），各 sbot `--web-host` 连接 |
 | **web-only** | `--web`（无飞书凭证） | ❌ | PTY + Web 终端，无飞书 |
 | single/master | `FEISHU_MODE=single/master` | — | 旧模式（deprecated，勿用） |
