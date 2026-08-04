@@ -257,12 +257,12 @@ export class FeishuBridge {
             // 调试日志
             logger.info(this.tag, `群聊消息 mentions=${JSON.stringify(mentions)} rawContent=${msg.content} (我=${myBotName})`);
 
-            // 检查是否 @了所有人（飞书用 @_all 表示 @所有人，mentions 为空数组）
+            // 检查是否 @了所有人（飞书 @所有人 content 占位符：旧 @_all / 新 @all / 文本 @所有人）
             const rawText = msg.content || '';
-            const mentionAll = rawText.includes('@_all') ||
+            const mentionAll = rawText.includes('@_all') || rawText.includes('@all') || rawText.includes('@所有人') ||
               mentions.some(m =>
                 m?.id?.open_id === 'all' ||
-                m?.key === 'all' ||
+                m?.key === 'all' || m?.key === '@_all' || m?.key === '@all' ||
                 m?.name === '所有人'
               );
             // 检查是否 @了当前机器人（用 name 匹配）
