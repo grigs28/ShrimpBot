@@ -549,6 +549,7 @@ export class FeishuBridge {
   private handleAskUserQuestion(toolUseId: string, questions: any[]): void {
     const targetChatId = this.responseChatId || this.defaultChatId;
     if (!targetChatId) {
+      logger.warn(this.tag, 'AskUserQuestion 审批无可用 chatId，已 deny——请先从飞书发一条消息建立会话');
       logger.warn(this.tag, `AskUserQuestion 无目标 chatId，fail-closed 回 deny (${toolUseId})`);
       this.sendApprovalResponse(toolUseId, { behavior: 'deny', message: '无目标会话' });
       return;
