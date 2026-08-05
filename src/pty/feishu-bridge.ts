@@ -113,6 +113,17 @@ export class FeishuBridge {
   private sdkMode: boolean = false;
   /** 方案 C：SDK 模式下 Web 广播回调（SDK 事件 → Web xterm，替代 PTY raw） */
   private sdkWebBroadcast: ((data: string) => void) | null = null;
+  /**
+   * A2：等待飞书回复的 AskUserQuestion 审批（toolUseId → { resolve, questions, timer }）。
+   * 裁决 1：resolve 的 outcome 为完整 PermissionResult（allow/deny 两条路径共用）。
+   * 裁决 2：存 questions + timer，便于回复路径解析答案并 clearTimeout（避免回复后超时仍触发 deny）。
+   * AskUserQuestion 串行：同时只有一个挂起审批。
+   */
+  private pendingQuestions = new Map<string, {
+    resolve: (outcome: PermissionResult) => void;
+    questions: any[];
+    timer: NodeJS.Timeout;
+  }>();
 
   private static readonly DANGEROUS_PATTERNS = [
     /rm\s+-rf/i, /rm\s+-r\s+/i, /drop\s+table/i, /delete\s+from/i,
@@ -379,6 +390,33 @@ export class FeishuBridge {
 
     const chatLabel = event.chatType === 'p2p' ? '私聊' : '群聊';
 
+    // A2：优先处理 AskUserQuestion 审批回复（串行，同时只有一个挂起）。
+    // 命中后立即 return，不走正常 dispatch，避免把 "1" 发给 claude 当新消息。
+    if (this.pendingQuestions.size > 0) {
+      const entry = this.pendingQuestions.entries().next().value;
+      if (entry) {
+        const [toolUseId, pending] = entry;
+        const q = pending.questions?.[0] || {};
+        const opts: any[] = q.options || [];
+        let answer = text;
+        if (/^\d+$/.test(text)) {
+          const idx = parseInt(text, 10) - 1;
+          if (opts[idx]) answer = String(opts[idx].label);
+        } else {
+          const match = opts.find((o: any) => o.label === text);
+          if (match) answer = String(match.label);
+        }
+        clearTimeout(pending.timer);
+        this.pendingQuestions.delete(toolUseId);
+        logger.info(this.tag, `[${chatLabel}] AskUserQuestion 回复: "${text}" → "${answer}" (${event.chatId})`);
+        pending.resolve({
+          behavior: 'allow',
+          updatedInput: { questions: pending.questions, answers: { [q.question || '']: answer } },
+        });
+        return;
+      }
+    }
+
     // 等待选项回答 → 直接发送（但排除常见命令，防止误判）
     if (this.waitingForAnswer) {
       const isLikelyCommand = /^(ls|dir|cat|pwd|cd|help|hi|hello|你好|测试)/i.test(text) || text.length > 50;
@@ -499,6 +537,69 @@ export class FeishuBridge {
       this.claudeBusy = false;
       this.processQueue();
     }
+  }
+
+  /**
+   * A2：收到 hub 转发的 AskUserQuestion 选项请求（WS approval-request）。
+   * 渲染飞书选项卡片 → 等用户飞书文本回复（编号或选项名，在 handleFeishuMessage 里路由回来）
+   * → 经 WS 回 approval-response。
+   * 裁决 1（fail-closed）：用户回复 → allow + updatedInput.answers；5min 超时 → deny('审批超时')。
+   * 两条路径都 clearTimeout + 删 pendingQuestions 条目。
+   */
+  private handleAskUserQuestion(toolUseId: string, questions: any[]): void {
+    const targetChatId = this.responseChatId || this.defaultChatId;
+    if (!targetChatId) {
+      logger.warn(this.tag, `AskUserQuestion 无目标 chatId，fail-closed 回 deny (${toolUseId})`);
+      this.sendApprovalResponse(toolUseId, { behavior: 'deny', message: '无目标会话' });
+      return;
+    }
+
+    // 渲染选项卡片：问题 + 编号选项 + 回复方式提示
+    const lines: string[] = ['🟡 请选择（回复编号或选项名）：'];
+    for (const q of questions || []) {
+      if (q?.question) lines.push(String(q.question));
+      (q?.options || []).forEach((o: any, i: number) => {
+        lines.push(`${i + 1}. ${o?.label}${o?.description ? ' - ' + o.description : ''}`);
+      });
+    }
+    void this.patchCard('yellow', '🟡 请选择', lines.join('\n'));
+
+    // 注册挂起审批，5min 超时 fail-closed deny（裁决 1：超时不 allow）
+    const promise = new Promise<PermissionResult>((resolve) => {
+      const timer = setTimeout(() => {
+        if (this.pendingQuestions.has(toolUseId)) {
+          this.pendingQuestions.delete(toolUseId);
+          logger.warn(this.tag, `AskUserQuestion 审批超时，fail-closed deny (${toolUseId})`);
+          resolve({ behavior: 'deny', message: '审批超时' });
+        }
+      }, 5 * 60 * 1000);
+      this.pendingQuestions.set(toolUseId, { resolve, questions: questions || [], timer });
+    });
+
+    promise.then((outcome) => {
+      this.sendApprovalResponse(toolUseId, outcome);
+      if (outcome.behavior === 'allow') {
+        const answers = (outcome as any).updatedInput?.answers || {};
+        void this.patchCard('green', '🟢 已选择', Object.values(answers).join(', ') || '已确认');
+      } else {
+        void this.patchCard('red', '🔴 已拒绝', (outcome as any).message || '审批超时');
+      }
+    });
+  }
+
+  /** A2：经远程 WS 回 approval-response 给 hub（decision 为完整 PermissionResult） */
+  private sendApprovalResponse(toolUseId: string, decision: PermissionResult): void {
+    const ws = this.remoteWebWs;
+    if (!ws || ws.readyState !== WS.OPEN) {
+      logger.warn(this.tag, `远程 WS 不可用，approval-response 发送失败 (${toolUseId})`);
+      return;
+    }
+    ws.send(JSON.stringify({
+      type: 'approval-response',
+      toolUseId,
+      decision,
+      botName: this.config.botName || 'ShrimpBot',
+    }));
   }
 
   private dispatchToClaude(event: FeishuEvent, text: string): void {
@@ -1490,6 +1591,10 @@ export class FeishuBridge {
             } else if (parsed.type === 'hook' && parsed.event) {
               // Hook 事件 → 本地处理
               this.handleHookEvent(parsed.event as HookEvent);
+            } else if (parsed.type === 'approval-request' && parsed.kind === 'question') {
+              // A2：hub 转发的 AskUserQuestion 选项请求 → 飞书选项卡片 → 等用户回复 → 回 approval-response
+              if (parsed.targetBot && parsed.targetBot !== botId) return;
+              this.handleAskUserQuestion(parsed.toolUseId, parsed.questions || []);
             }
           } catch { /* ignore */ }
         });
@@ -1528,6 +1633,8 @@ export class FeishuBridge {
     if (this.stopHookTimer) { clearTimeout(this.stopHookTimer); this.stopHookTimer = null; }
     if (this.completionTimer) { clearTimeout(this.completionTimer); this.completionTimer = null; }
     this.pendingOptions = [];
+    for (const p of this.pendingQuestions.values()) clearTimeout(p.timer);
+    this.pendingQuestions.clear();
     this.waitingForAnswer = false;
     this.messageQueue = [];
     this.claudeBusy = false;
