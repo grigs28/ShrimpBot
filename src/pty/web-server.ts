@@ -752,6 +752,12 @@ export class WebServer {
   getPort(): number { return this.port; }
 
   stop(): void {
+    // 清理挂起审批：fail-closed deny，避免 Promise 永不响应、timer 活到进程退出
+    for (const [, p] of this.pendingApprovals) {
+      clearTimeout(p.timer);
+      p.resolve({ behavior: 'deny', message: 'server stopping' });
+    }
+    this.pendingApprovals.clear();
     for (const [, ws] of this.botConnections) {
       ws.close();
     }
