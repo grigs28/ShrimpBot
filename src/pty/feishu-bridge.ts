@@ -1593,7 +1593,8 @@ export class FeishuBridge {
               this.handleHookEvent(parsed.event as HookEvent);
             } else if (parsed.type === 'approval-request' && parsed.kind === 'question') {
               // A2：hub 转发的 AskUserQuestion 选项请求 → 飞书选项卡片 → 等用户回复 → 回 approval-response
-              if (parsed.targetBot && parsed.targetBot !== botId) return;
+              // hub 按契约发的是 botName 字段（定向发送，对齐 web-server.ts 的 approval-request 载荷）
+              if (parsed.botName && parsed.botName !== botId) return;
               this.handleAskUserQuestion(parsed.toolUseId, parsed.questions || []);
             }
           } catch { /* ignore */ }
