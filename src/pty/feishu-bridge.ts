@@ -120,7 +120,6 @@ export class FeishuBridge {
    * AskUserQuestion 串行：同时只有一个挂起审批。
    */
   private pendingQuestions = new Map<string, {
-    resolve: (outcome: PermissionResult) => void;
     questions: any[];
     timer: NodeJS.Timeout;
   }>();
@@ -392,6 +391,9 @@ export class FeishuBridge {
 
     // A2：优先处理 AskUserQuestion 审批回复（串行，同时只有一个挂起）。
     // 命中后立即 return，不走正常 dispatch，避免把 "1" 发给 claude 当新消息。
+    // 投递方式：sendToPty(answer)——claude 已在 AskUserQuestion TUI 等待（handleAskUserQuestion
+    // 收到请求时立即回了 allow），把选项 label 写进 PTY 即被 claude 接收。
+    // （updatedInput 注入对 AskUserQuestion 无效——它改工具输入不改结果，故改用 PTY 投递。）
     if (this.pendingQuestions.size > 0) {
       const entry = this.pendingQuestions.entries().next().value;
       if (entry) {
@@ -408,11 +410,9 @@ export class FeishuBridge {
         }
         clearTimeout(pending.timer);
         this.pendingQuestions.delete(toolUseId);
-        logger.info(this.tag, `[${chatLabel}] AskUserQuestion 回复: "${text}" → "${answer}" (${event.chatId})`);
-        pending.resolve({
-          behavior: 'allow',
-          updatedInput: { questions: pending.questions, answers: { [q.question || '']: answer } },
-        });
+        logger.info(this.tag, `[${chatLabel}] AskUserQuestion 回复: "${text}" → "${answer}"，写入 PTY (${event.chatId})`);
+        this.sendToPty(answer);
+        void this.patchCard('green', '🟢 已选择', answer);
         return;
       }
     }
@@ -541,21 +541,27 @@ export class FeishuBridge {
 
   /**
    * A2：收到 hub 转发的 AskUserQuestion 选项请求（WS approval-request）。
-   * 渲染飞书选项卡片 → 等用户飞书文本回复（编号或选项名，在 handleFeishuMessage 里路由回来）
-   * → 经 WS 回 approval-response。
-   * 裁决 1（fail-closed）：用户回复 → allow + updatedInput.answers；5min 超时 → deny('审批超时')。
-   * 两条路径都 clearTimeout + 删 pendingQuestions 条目。
+   * 机制（PTY 投递，非 updatedInput）：
+   *   1) 立即回 allow → claude 执行 AskUserQuestion，进入 TUI 等待用户输入。
+   *   2) 渲染干净选项卡片（结构化 questions，非 PTY 文本解析——避免 A1 的噪声）。
+   *   3) 用户飞书回复 → handleFeishuMessage 路由 → 解析编号/选项名为 label → sendToPty(label)
+   *      → claude 的 AskUserQuestion TUI 收到 → 按选择继续。
+   * （updatedInput 注入对 AskUserQuestion 无效：它改工具输入参数不改结果，而答案是结果；
+   *  PermissionRequest 在工具执行前触发，此时无答案可注入。故改用 PTY 投递。）
+   * 无 chatId → fail-closed deny。5min 无回复 → 清挂起（claude 仍在 TUI，可终端/Web/飞书补答）。
    */
   private handleAskUserQuestion(toolUseId: string, questions: any[]): void {
     const targetChatId = this.responseChatId || this.defaultChatId;
     if (!targetChatId) {
       logger.warn(this.tag, 'AskUserQuestion 审批无可用 chatId，已 deny——请先从飞书发一条消息建立会话');
-      logger.warn(this.tag, `AskUserQuestion 无目标 chatId，fail-closed 回 deny (${toolUseId})`);
       this.sendApprovalResponse(toolUseId, { behavior: 'deny', message: '无目标会话' });
       return;
     }
 
-    // 渲染选项卡片：问题 + 编号选项 + 回复方式提示
+    // 1) 立即回 allow：让 claude 执行 AskUserQuestion 进 TUI 等待（答案后续由 PTY 投递）
+    this.sendApprovalResponse(toolUseId, { behavior: 'allow' });
+
+    // 2) 渲染干净选项卡片：问题 + 编号选项 + 回复方式提示
     const lines: string[] = ['🟡 请选择（回复编号或选项名）：'];
     for (const q of questions || []) {
       if (q?.question) lines.push(String(q.question));
@@ -565,27 +571,15 @@ export class FeishuBridge {
     }
     void this.patchCard('yellow', '🟡 请选择', lines.join('\n'));
 
-    // 注册挂起审批，5min 超时 fail-closed deny（裁决 1：超时不 allow）
-    const promise = new Promise<PermissionResult>((resolve) => {
-      const timer = setTimeout(() => {
-        if (this.pendingQuestions.has(toolUseId)) {
-          this.pendingQuestions.delete(toolUseId);
-          logger.warn(this.tag, `AskUserQuestion 审批超时，fail-closed deny (${toolUseId})`);
-          resolve({ behavior: 'deny', message: '审批超时' });
-        }
-      }, 5 * 60 * 1000);
-      this.pendingQuestions.set(toolUseId, { resolve, questions: questions || [], timer });
-    });
-
-    promise.then((outcome) => {
-      this.sendApprovalResponse(toolUseId, outcome);
-      if (outcome.behavior === 'allow') {
-        const answers = (outcome as any).updatedInput?.answers || {};
-        void this.patchCard('green', '🟢 已选择', Object.values(answers).join(', ') || '已确认');
-      } else {
-        void this.patchCard('red', '🔴 已拒绝', (outcome as any).message || '审批超时');
+    // 3) 注册挂起：5min 超时清条目（claude 仍在 TUI 等待，可补答；不再 deny，因已 allow）
+    const timer = setTimeout(() => {
+      if (this.pendingQuestions.has(toolUseId)) {
+        this.pendingQuestions.delete(toolUseId);
+        logger.warn(this.tag, `AskUserQuestion 5min 无回复，已超时（claude 仍在 TUI 等待，可从终端/Web/飞书补答） (${toolUseId})`);
+        void this.patchCard('red', '🔴 选择超时', '5 分钟无回复，可从终端/Web/飞书补答');
       }
-    });
+    }, 5 * 60 * 1000);
+    this.pendingQuestions.set(toolUseId, { questions: questions || [], timer });
   }
 
   /** A2：经远程 WS 回 approval-response 给 hub（decision 为完整 PermissionResult） */
@@ -742,7 +736,8 @@ export class FeishuBridge {
         this.fallbackPtyText = text;
 
         // 权限确认 / 编号选项：流式阶段检测到就立即发飞书，不等 ❯
-        if (!this.waitingForAnswer && !this.permissionNotified) {
+        // A2 激活（pendingQuestions 非空）时抑制——A2 已显干净卡片且自己处理回复，避免重复/噪声卡片
+        if (!this.waitingForAnswer && !this.permissionNotified && this.pendingQuestions.size === 0) {
           const isYesNoQ = this.isYesNoQuestion(this.streamBuffer);
           const hasOpts = this.containsNumberedOptions(this.streamBuffer);
           if (isYesNoQ || hasOpts) {
