@@ -7,7 +7,7 @@
 > **要求**：
 > - Claude Code CLI ≥ v2.1.47（PTY 与 SDK 模式均需 `claude` 在 PATH；SDK 模式 spawn claude 子进程）
 > - Linux/macOS：`npm install` 需 `python3 make g++`（编译 node-pty）
-> **版本**：v1.3.0 — 方案 C（SDK 模式 Web 显示 SDK 事件流，飞书+Web 同一 claude 实时同步）+ Docker hub 架构 + SSO 集成 + PTY 误判减少 + @所有人 兼容
+> **版本**：v1.4.0 — A2 权限审批（去 `--dangerously-skip-permissions`；ApprovalGate 普通工具自动 allow 等效 bypass，AskUserQuestion 走飞书结构化选项卡片 + PTY 投递）+ 方案 C（SDK 模式 Web 显示 SDK 事件流，飞书+Web 同一 claude 实时同步）+ Docker hub 架构 + SSO 集成
 
 ## 快速开始 / Quick Start
 
