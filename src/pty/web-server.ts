@@ -64,7 +64,7 @@ export class WebServer {
   /** 多咪连接：botName → WebSocket */
   private botConnections = new Map<string, WebSocket>();
   /** 等待 Code咪 审批回复的 Promise（toolUseId → {resolve, timer}） */
-  private pendingApprovals = new Map<string, { resolve: (v: any) => void; timer: NodeJS.Timeout }>();
+  private pendingApprovals = new Map<string, { resolve: (v: any) => void; timer: NodeJS.Timeout; botName: string }>();
   /** 远程 bot 的附加信息（cwd 等） */
   private botInfo = new Map<string, { cwd: string }>();
   /** 当前活跃标签（浏览器端选中的 bot） */
@@ -325,7 +325,7 @@ export class WebServer {
           this.pendingApprovals.delete(toolUseId);
           resolve({ behavior: 'deny', message: '审批超时' });
         }, 5 * 60 * 1000);
-        this.pendingApprovals.set(toolUseId, { resolve, timer });
+        this.pendingApprovals.set(toolUseId, { resolve, timer, botName });
         botWs.send(JSON.stringify({ type: 'approval-request', kind: 'question', toolUseId, questions: (toolInput as any).questions, botName }));
       });
 
@@ -680,6 +680,14 @@ export class WebServer {
         if (botName) {
           this.botConnections.delete(botName);
           this.botInfo.delete(botName);
+          // 清理该 bot 的挂起审批：fail-closed deny，避免 claude 阻塞等满 5min 超时
+          for (const [toolUseId, p] of this.pendingApprovals) {
+            if (p.botName === botName) {
+              clearTimeout(p.timer);
+              this.pendingApprovals.delete(toolUseId);
+              p.resolve({ behavior: 'deny', message: 'bot disconnected' });
+            }
+          }
           logger.info(this.tag, `Bot 提供者已断开: ${botName} (剩余: ${this.botConnections.size})`);
           if (this.activeBot === botName) {
             this.activeBot = this.botConnections.keys().next().value || '';
