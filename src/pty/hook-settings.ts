@@ -71,7 +71,8 @@ export function ensureHookSettings(host: string, botName?: string): void {
     let hookEntry: { matcher: string; hooks: any[] };
     if (eventName === 'PermissionRequest') {
       // A2 同步 HTTP hook：web-server 阻塞返回 allow/deny decision（安全自动 allow / 危险飞书审批）
-      hookEntry = { matcher: '', hooks: [{ type: 'http', url: `${base}/api/hook/approval${botParam}`, timeout: 300 }] };
+      // timeout(秒) 必须 > max(hub 5min, Code咪 5min) 审批超时，否则 HTTP hook 超时(non-blocking)会绕过 A2 走默认权限流程
+      hookEntry = { matcher: '', hooks: [{ type: 'http', url: `${base}/api/hook/approval${botParam}`, timeout: 330 }] };
     } else if (eventName === 'SessionStart') {
       hookEntry = { matcher: '', hooks: [{ type: 'command', command: SESSION_START_COMMAND }] };
     } else {
