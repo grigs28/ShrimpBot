@@ -68,10 +68,10 @@ CLAUDE_CWD=/path/to/project
 | **飞书消息走向** | PTY claude（`pty.send`） | SDK claude（`query` spawn，独立后台） |
 | **Web 显示** | PTY raw（TUI，三端同一 claude）| SDK 事件流（飞书+Web 同一 SDK claude） |
 | **Web 输入** | PTY claude（回复 Web 可见） | PTY claude（独立，回复不进 SDK 事件流） |
-| **优势** | 三端完全同步（飞书/Web/终端同一 claude）| 飞书结构化（无正则/选项误判、canUseTool 审批可期） |
-| **劣势** | 正则解析脆弱（A1 门控缓解）、`--dangerously-skip-permissions` | Web 输入与 SDK 显示通道分离（方案 C 未覆盖 Web 输入） |
+| **优势** | 三端完全同步（飞书/Web/终端同一 claude）；**A2 权限审批已接入**（ApprovalGate + AskUserQuestion 飞书卡片） | 飞书结构化（无正则/选项误判） |
+| **劣势** | 正则解析脆弱（A1 门控缓解） | Web 输入与 SDK 显示通道分离（方案 C 未覆盖 Web 输入）；**A2 审批尚未接入**（onApproval 无条件 allow） |
 
-**选型**：要三端完全同步用 PTY（默认）；要飞书结构化 + Web 看飞书问答用 SDK（方案 C）。
+**选型**：要三端完全同步 + 飞书权限审批用 PTY（默认）；要飞书结构化 + Web 看飞书问答用 SDK（方案 C）。
 
 ### 启动逻辑
 
@@ -144,13 +144,38 @@ Claude 选项（全部透传给 Claude Code CLI）:
 
 自动配置 Claude Code hooks 推送事件：
 
-| Hook 事件 | 用途 |
-|-----------|------|
-| `Stop` | 任务完成，更新飞书卡片 |
-| `Notification` | Claude 主动通知用户 |
-| `PostToolUse` | 工具调用成功（Bash/Write/Edit 等发"🔄 处理中"中间态） |
-| `PostToolUseFailure` | 工具调用出错 |
-| `SubagentStop` | 子代理完成（发"🔄 处理中"中间态） |
+| Hook 事件 | 类型 | 用途 |
+|-----------|------|------|
+| `Stop` | command | 任务完成，更新飞书卡片 |
+| `Notification` | command | Claude 主动通知用户 |
+| `PostToolUse` | command | 工具调用成功（Bash/Write/Edit 等发"🔄 处理中"中间态） |
+| `PostToolUseFailure` | command | 工具调用出错 |
+| `SubagentStop` | command | 子代理完成（发"🔄 处理中"中间态） |
+| `SessionStart` | command | 输出 additionalContext，引导 Claude 优先用 AskUserQuestion（结构化选项，飞书端可可靠识别） |
+| `PermissionRequest` | **http**（同步）| **A2 权限审批**：hub 阻塞返回 allow/deny（普通工具自动 allow 等效 bypass；AskUserQuestion 转发飞书选项卡片）。timeout 330s |
+
+## 权限审批 / Permission Approval（A2，PTY 模式）
+
+去掉 `--dangerously-skip-permissions`，claude 以 **default 模式**启动（PermissionRequest hook 可触发），由 **ApprovalGate** 决定每个工具的走向：
+
+- **普通工具**（Bash/Write/Read/…）→ `classify` 返回 `allow` → hub 立即放行（**等效 bypass**，不审批、不卡）。
+- **AskUserQuestion** → 转发飞书**结构化选项卡片** → 用户回复编号/选项名 → 答案经 **PTY 投递**回 claude → 按选择继续。
+
+```
+claude 调工具 → PermissionRequest hook(http) POST hub /api/hook/approval?bot=X
+  ├─ 普通工具 → classify=allow → 立即放行
+  └─ AskUserQuestion → classify=question → WS approval-request → Code咪
+        → 飞书🟡选项卡片（1.xx 2.xx …，结构化渲染）
+        → 用户回复"1"/选项名 → 解析为 label → sendToPty(label)
+        → claude AskUserQuestion TUI 收到 → 按选择继续
+```
+
+**关键约束**：
+- 答案**必须经 PTY 投递**——`PermissionRequest` 的 `updatedInput` 只改工具输入参数、不改结果，而 AskUserQuestion 的答案是结果（hook 在执行前触发，无答案可注入）。故 A2 收到请求后**立即回 allow** 让 claude 进 TUI 等待，再于回复时写 PTY。
+- 启动 Code咪 **不要用 `-c`/`--resume`**：会续上一个 bypass 会话（或同 cwd 下别的 bypass 会话）→ 继承 bypass 权限模式 → PermissionRequest 不触发 → A2 失效。需全新 default 会话。
+- 5 min 无回复：claude 仍在 AskUserQuestion TUI 等待，可从终端/Web/飞书补答。
+
+> ⚠️ **SDK 模式（`SDK_EVENT_MODE=true`）尚未接入 A2**：其 `onApproval` 目前无条件 allow。PTY/SDK 两路径审批语义待统一。
 
 ## 架构 / Architecture
 
@@ -160,11 +185,13 @@ Claude 选项（全部透传给 Claude Code CLI）:
 终端 Terminal ←stdin/stdout→ FeishuBridge
 Web Browser ←WebSocket→ WebServer ←→ FeishuBridge
 
-Claude Code Hooks (Stop/Notification/PostToolUse/PostToolUseFailure/SubagentStop)
+Claude Code Hooks (Stop/Notification/PostToolUse/PostToolUseFailure/SubagentStop/SessionStart)
   └── curl POST /api/hook → WebServer → FeishuBridge → 飞书
+Claude Code PermissionRequest hook (http 同步)
+  └── POST /api/hook/approval → ApprovalGate → 普通工具 allow / AskUserQuestion 转发飞书卡片（见「权限审批 A2」）
 
 # 多咪架构（Docker web-server hub + 各 sbot 连接）
-Docker web-server (:5554, 仅 Web UI + Hook API)
+Docker web-server (:5554, 仅 Web UI + Hook API，含 /api/hook/approval 端点)
   ├── /ws/bot ← sbot (Code咪) --web-host  — PTY + 飞书 + SDK
   └── /ws/bot ← sbot (其他咪) --web-host  — PTY + 飞书
 ```
@@ -208,8 +235,8 @@ sbot
 ```bash
 # 本机构建镜像（无外网的生产机需本机 build 后传）
 npm run build                              # 先编译 dist
-docker build -t shrimpbot:v1.1.0 .
-docker save shrimpbot:v1.1.0 | gzip | ssh user@prod 'gunzip | docker load'
+docker build -t shrimpbot:v1.4.0 .
+docker save shrimpbot:v1.4.0 | gzip | ssh user@prod 'gunzip | docker load'
 
 # 生产机启动（docker-compose.yml 见仓库根目录）
 docker compose up -d
