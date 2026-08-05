@@ -71,10 +71,11 @@ export class PTYManager {
     }
 
     const claudePath = resolveClaudePath(this.options.claudePath || 'claude');
-    // 暂保留 --dangerously-skip-permissions；A2 完整（PermissionRequest 审批端点 + hub 协议）落地后改 acceptEdits
-    const baseArgs = ['--dangerously-skip-permissions'];
+    // A2：去掉 --dangerously-skip-permissions（default 模式，PermissionRequest hook 可触发）
+    // ApprovalGate（hub 端）对非 AskUserQuestion 工具自动 allow，行为等效 bypass
+    const baseArgs: string[] = [];
     const extraArgs = (this.options.extraArgs || []).filter(
-      a => !baseArgs.includes(a)
+      a => a !== '--dangerously-skip-permissions'
     );
     const args = [...baseArgs, ...extraArgs];
 
