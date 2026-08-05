@@ -14,58 +14,44 @@
 3. 统一走 **PermissionRequest hook**（结构化，不再正则猜 TUI 文本）
 4. 保留 hub 多咪架构（hook POST hub，hub WS 转发 Code咪）
 
-## 2. 权限模型
+## 2. 权限模型（等效 bypass，只 AskUserQuestion 发飞书）
 
-- pty-manager：去 `--dangerously-skip-permissions`，改 `--permission-mode acceptEdits`
-  - acceptEdits：文件编辑（Edit/Write）+ 常见文件命令（mkdir/touch/mv/cp）自动 allow
-  - Bash/其他工具 → PermissionRequest hook
-- SDK 模式（SDKSession）：default 模式（canUseTool 已就绪，阶段 B 接入）
+- pty-manager：**去掉 `--dangerously-skip-permissions`**（default 模式，PermissionRequest hook 可触发）
+- ApprovalGate 判断（hub 端）：
+  - **AskUserQuestion** → 转发飞书选项卡片（用户回复）
+  - **其他所有工具**（Bash/Write/Read/危险命令）→ **自动 allow**（等价 bypass 不审批）
+- 效果：行为等价 `--dangerously-skip-permissions`（不审批/不拦截危险），但 AskUserQuestion 走结构化 hook → 飞书选项
 
 ## 3. 数据流（hub 转发）
 
 ```
-claude 工具调用（Bash 危险 / AskUserQuestion）
-  → PermissionRequest hook(type:http) POST hub/api/hook/approval?bot=Code咪
+claude 任意工具调用 → PermissionRequest hook(type:http) POST hub/api/hook/approval?bot=Code咪
 hub:
   收 {tool_name, tool_input, tool_use_id}
   ApprovalGate 判断：
-    ├─ 安全（Read/Glob/Grep + 安全 Bash 白名单）→ 立即返回 allow
-    ├─ 审批（危险 Bash/Write：rm/sudo/dd/DANGEROUS_PATTERNS/disallowedTools）
-    │    → WS {type:'approval-request', kind:'approval', toolUseId, toolName, input} 给 Code咪
+    ├─ tool_name='AskUserQuestion'
+    │    → WS {type:'approval-request', kind:'question', toolUseId, questions} 给 Code咪
     │    → await Promise（5min 超时）
-    └─ 选项（AskUserQuestion）
-         → WS {type:'approval-request', kind:'question', toolUseId, questions} 给 Code咪
-         → await Promise（5min 超时）
+    └─ 其他工具 → 立即返回 allow（等价 bypass，不审批）
 Code咪 feishu-bridge:
-  收 WS approval-request
-    ├─ kind:'approval' → 飞书 🟡审批卡片（工具名+命令预览+"回复 allow/deny"）
-    └─ kind:'question' → 飞书 🟡选项卡片（问题+选项列表+"回复编号/选项名"）
-  → pendingApprovals Map<toolUseId, resolve>
-  → 用户飞书回复 → WS {type:'approval-response', toolUseId, decision/answers} 回 hub
+  收 WS approval-request(kind:'question')
+    → 飞书 🟡选项卡片（问题 + 1.xxx 2.xxx + "回复编号/选项名"）
+    → pendingApprovals Map<toolUseId, resolve>
+    → 用户飞书回复"1"或选项名 → WS {type:'approval-response', toolUseId, answers} 回 hub
 hub:
   收 approval-response → resolve Promise
-    ├─ approval → HTTP 返回 {decision:{behavior:'allow'/'deny'}}
-    └─ question → HTTP 返回 {behavior:'allow', updatedInput:{questions, answers}}
-  超时 5min → 默认 deny（fail-closed）
+    → HTTP 返回 {behavior:'allow', updatedInput:{questions, answers}}
+  超时 5min → 默认 deny（fail-closed，AskUserQuestion 不应静默 allow 未知选项）
 ```
 
-## 4. ApprovalGate 安全判断（纯函数，可单测）
+## 4. ApprovalGate 判断（纯函数，可单测）
 
 新增 `src/sdk/approval-gate.ts`：
 ```typescript
-// 返回：'allow'（安全自动）| 'approval'（危险，飞书审批）| 'question'（AskUserQuestion）
-function classify(toolName: string, input: Record<string,unknown>): 'allow' | 'approval' | 'question' {
+// 等效 bypass：只 AskUserQuestion 转发飞书，其他全 allow（不审批）
+function classify(toolName: string, _input: Record<string,unknown>): 'allow' | 'question' {
   if (toolName === 'AskUserQuestion') return 'question';
-  // 安全白名单（自动 allow）
-  if (SAFE_TOOLS.has(toolName)) return 'allow';  // Read/Glob/Grep/LSH...
-  if (toolName === 'Bash') {
-    const cmd = String(input.command || '');
-    if (SAFE_BASH_PATTERNS.some(p => p.test(cmd))) return 'allow';      // ls/cat/grep/git status/echo...
-    if (DANGEROUS_PATTERNS.some(p => p.test(cmd))) return 'approval';   // rm -rf/sudo/dd...
-    return 'approval';  // 未知 Bash 默认审批
-  }
-  if (['Write','Edit','MultiEdit'].includes(toolName)) return 'allow';  // acceptEdits 已 cover，兜底
-  return 'approval';  // 未知工具默认审批
+  return 'allow';  // 其他全 allow（等价 --dangerously-skip-permissions）
 }
 ```
 
@@ -73,10 +59,10 @@ function classify(toolName: string, input: Record<string,unknown>): 'allow' | 'a
 
 | 文件 | 改动 |
 |---|---|
-| `pty-manager.ts` | `--permission-mode acceptEdits`（去 `--dangerously-skip-permissions`）|
+| `pty-manager.ts` | **去掉 `--dangerously-skip-permissions`**（default 模式；ApprovalGate 等效 bypass）|
 | `hook-settings.ts` | PermissionRequest type:http（**A2.2 已做**）|
-| `src/sdk/approval-gate.ts`（新） | classify 安全/审批/选项 + allowlist 常量（纯函数 + 单测）|
-| `web-server.ts`（hub） | `/api/hook/approval` 端点（classify → 安全 allow / WS approval-request）+ Promise Map + WS `approval-response` 收 |
+| `src/sdk/approval-gate.ts`（新） | classify：AskUserQuestion→question，其他→allow（纯函数 + 单测）|
+| `web-server.ts`（hub） | `/api/hook/approval` 端点（classify → question 转发 / 其他 allow）+ Promise Map + WS `approval-response` 收 |
 | `web-server.ts`（Code咪 bridge 端） | WS 收 `approval-request` → 转发 feishu-bridge；发 `approval-response` 回 hub |
 | `feishu-bridge.ts` | 审批/选项卡片渲染 + `pendingApprovals` Map + 飞书回复路由（allow/deny 或选项 answers）+ 超时 |
 
