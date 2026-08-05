@@ -11,6 +11,7 @@ import { loadBotsRegistry, saveBotsRegistry } from '../config.js';
 import { upsertUser, getUserRole, setUserRole, deleteUser, loadUsers, isAdmin } from './web-users.js';
 import { loadCommands, addCommand, deleteCommand, saveCommands } from './web-commands.js';
 import type { HookEvent } from '../types/index.js';
+import { classify } from '../sdk/approval-gate.js';
 
 export interface WebServerDeps {
   /** PTY 原始数据广播（独立 Web 模式不需要） */
@@ -62,6 +63,8 @@ export class WebServer {
   private clients = new Set<WebSocket>();
   /** 多咪连接：botName → WebSocket */
   private botConnections = new Map<string, WebSocket>();
+  /** 等待 Code咪 审批回复的 Promise（toolUseId → {resolve, timer}） */
+  private pendingApprovals = new Map<string, { resolve: (v: any) => void; timer: NodeJS.Timeout }>();
   /** 远程 bot 的附加信息（cwd 等） */
   private botInfo = new Map<string, { cwd: string }>();
   /** 当前活跃标签（浏览器端选中的 bot） */
@@ -292,6 +295,42 @@ export class WebServer {
         this.deps.onHookEvent(event);
       }
       res.json({ ok: true });
+    });
+
+    // A2: PermissionRequest hook（type:http 同步）—— ApprovalGate classify
+    this.app.post('/api/hook/approval', async (req, res) => {
+      const toolName = req.body?.tool_name as string;
+      const toolInput = req.body?.tool_input || {};
+      const toolUseId = req.body?.tool_use_id as string;
+      const botName = (req.query.bot as string) || '';
+      const verdict = classify(toolName, toolInput);
+
+      if (verdict === 'allow') {
+        // 等效 bypass：非 AskUserQuestion 立即 allow
+        res.json({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } } });
+        return;
+      }
+
+      // AskUserQuestion → WS 转发给对应 bot（Code咪）
+      const botWs = this.botConnections.get(botName);
+      if (!botWs || botWs.readyState !== WebSocket.OPEN) {
+        // bot 未连接，fail-closed deny
+        res.json({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny', message: `bot ${botName} 未连接` } } });
+        return;
+      }
+
+      // 发 approval-request，await Code咪 回 approval-response（5min 超时 deny，fail-closed）
+      const reply = await new Promise<any>((resolve) => {
+        const timer = setTimeout(() => {
+          this.pendingApprovals.delete(toolUseId);
+          resolve({ behavior: 'deny', message: '审批超时' });
+        }, 5 * 60 * 1000);
+        this.pendingApprovals.set(toolUseId, { resolve, timer });
+        botWs.send(JSON.stringify({ type: 'approval-request', kind: 'question', toolUseId, questions: (toolInput as any).questions, botName }));
+      });
+
+      // reply = { behavior:'allow', updatedInput:{questions, answers} } 或 { behavior:'deny' }
+      res.json({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: reply } });
     });
 
     // ── 需要登录的路由 ──
@@ -620,6 +659,16 @@ export class WebServer {
               if (client.readyState === WebSocket.OPEN) {
                 client.send(bmsg);
               }
+            }
+          }
+
+          // approval-response：Code咪 回复 AskUserQuestion 审批（resolve 等待中的 Promise）
+          if (parsed.type === 'approval-response' && parsed.toolUseId) {
+            const p = this.pendingApprovals.get(parsed.toolUseId);
+            if (p) {
+              clearTimeout(p.timer);
+              this.pendingApprovals.delete(parsed.toolUseId);
+              p.resolve(parsed.decision);
             }
           }
         } catch {
