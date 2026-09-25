@@ -11,6 +11,7 @@ import { SDKSession } from '../sdk/sdk-session.js';
 import { FeishuCardRenderer } from '../sdk/feishu-card-renderer.js';
 import type { SDKBridgeEvent, ApprovalRequest, PermissionResult } from '../sdk/sdk-types.js';
 import { ReadyGate, deliverWhenReady } from './readiness-gate.js';
+import { RoundState } from './round-state.js';
 
 export interface BridgeConfig {
   feishuAppId: string;
@@ -59,6 +60,8 @@ export class FeishuBridge {
   private ptyReady = false;
   /** 投递门闸：TUI 未就绪时盲写会丢 \r，见 deliverWhenReady */
   private readyGate = new ReadyGate();
+  /** 轮次识别：hook prompt_id 识别不经输入路径发起的轮次（cron 计划任务），见 beginRound/onExternalRoundBegin */
+  private rounds = new RoundState();
   /** 等 TUI 就绪的最长时间；超时 fail-open 照常投递，绝不挂住消息 */
   private static readonly READY_TIMEOUT_MS = 30_000;
   /** PTY 完成时的兜底内容（Hook Stop 未触发时使用） */
@@ -612,16 +615,7 @@ export class FeishuBridge {
     this.responseChatId = event.chatId;
     this.defaultChatId = event.chatId;
     this.lastUserMessage = text;
-    this.completionHandled = false;
-    this.permissionNotified = false;
-    this.ptyReady = false;
-    this.notificationSent = false;
-    this.streamBuffer = '';
-    this.fallbackPtyText = '';
-    this.lastTranscriptPath = '';
-    this.lastAssistantMessage = '';
-    if (this.stopHookTimer) { clearTimeout(this.stopHookTimer); this.stopHookTimer = null; }
-    if (this.completionTimer) { clearTimeout(this.completionTimer); this.completionTimer = null; }
+    this.beginRound();
 
     const chatLabel = event.chatType === 'p2p' ? '私聊' : '群聊';
     logger.info(this.tag, `[${chatLabel}] 飞书 → Claude: "${text.slice(0, 100)}" (${event.chatId})`);
@@ -693,19 +687,7 @@ export class FeishuBridge {
     const chatId = this.responseChatId || this.defaultChatId;
     if (!chatId) return;
 
-    // 清理上一轮的 timer
-    if (this.stopHookTimer) { clearTimeout(this.stopHookTimer); this.stopHookTimer = null; }
-    if (this.completionTimer) { clearTimeout(this.completionTimer); this.completionTimer = null; }
-
-    // 重置状态
-    this.completionHandled = false;
-    this.permissionNotified = false;
-    this.ptyReady = false;
-    this.notificationSent = false;
-    this.streamBuffer = '';
-    this.fallbackPtyText = '';
-    this.lastTranscriptPath = '';
-    this.lastAssistantMessage = '';
+    this.beginRound();
 
     // 非 clone 模式发思考卡片
     if (!this.config.clone) {
@@ -724,6 +706,49 @@ export class FeishuBridge {
     }, 120_000);
 
     logger.info(this.tag, `外部输入开始新一轮: chatId=${chatId}`);
+  }
+
+  /**
+   * 统一轮次入口：复位全部轮次状态。
+   *
+   * 历史上这段复位散落在 dispatchToClaude 与 handleExternalCommand 两处（散弹式
+   * 修改各补各的，git blame 可证），导致新增输入源时容易漏补。任何"开始新一轮"
+   * 的路径都必须经过这里；不经输入路径发起的轮次（cron 计划任务）由
+   * onExternalRoundBegin 经 prompt_id 识别后同样走到这里。
+   */
+  private beginRound(): void {
+    this.completionHandled = false;
+    this.permissionNotified = false;
+    this.ptyReady = false;
+    this.notificationSent = false;
+    this.streamBuffer = '';
+    this.fallbackPtyText = '';
+    this.lastTranscriptPath = '';
+    this.lastAssistantMessage = '';
+    if (this.stopHookTimer) { clearTimeout(this.stopHookTimer); this.stopHookTimer = null; }
+    if (this.completionTimer) { clearTimeout(this.completionTimer); this.completionTimer = null; }
+  }
+
+  /**
+   * 输出侧识别到未经输入路径发起的新轮次（如会话内 cron 计划任务）：
+   * hook 的 prompt_id 变化且无轮次进行中。按统一入口开轮——恢复本轮的输出
+   * 可见性（思考卡 / Stop 定稿 / Notification），并置 claudeBusy 让轮中到达的
+   * 飞书消息排队而非直写 TUI。
+   */
+  private onExternalRoundBegin(chatId: string): void {
+    logger.info(this.tag, `Hook 识别到非输入发起的新轮次（prompt_id 变化）: chatId=${chatId}`);
+    this.beginRound();
+    if (!this.config.clone) {
+      this.sendThinkingCard(chatId);
+    }
+    this.claudeBusy = true;
+    if (this.busyTimer) clearTimeout(this.busyTimer);
+    this.busyTimer = setTimeout(() => {
+      if (this.claudeBusy) {
+        logger.warn(this.tag, '⏰ 外部轮次响应超时（120s），强制解除 claudeBusy');
+        this.processQueue();
+      }
+    }, 120_000);
   }
 
   private processQueue(): void {
@@ -1305,6 +1330,19 @@ export class FeishuBridge {
     if (!targetChatId) return;
 
     logger.info(this.tag, `Hook: ${event.hook_event_name}`);
+
+    // 轮次识别：Stop/Notification/PostToolUse/PostToolUseFailure 携带逐轮变化的 prompt_id。
+    // 无轮次进行中却出现不同的 id = 本轮未经任何输入路径发起（cron 计划任务）→ 按统一入口开轮。
+    // 排除 SubagentStop：它可能在轮次结束数分钟后迟到；排除 SessionStart：非轮次事件。
+    if (
+      event.prompt_id &&
+      (event.hook_event_name === 'Stop' || event.hook_event_name === 'Notification' ||
+        event.hook_event_name === 'PostToolUse' || event.hook_event_name === 'PostToolUseFailure')
+    ) {
+      if (this.rounds.observeHookPromptId(event.prompt_id, this.claudeBusy) === 'new-external') {
+        this.onExternalRoundBegin(targetChatId);
+      }
+    }
 
     switch (event.hook_event_name) {
       case 'Stop': {

@@ -1,6 +1,6 @@
 {
   "name": "claude-code-channels-feishu",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "Claude Code Channels bridge for Feishu",
   "type": "module",
   "main": "dist/index.js",

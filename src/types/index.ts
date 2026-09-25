@@ -57,6 +57,8 @@ export interface FeishuEvent {
 export interface HookEvent {
   hook_event_name: 'Stop' | 'Notification' | 'PostToolUseFailure' | 'PostToolUse' | 'PreToolUse' | 'SubagentStop';
   session_id?: string;
+  /** 逐轮变化（每轮一个 UUID）——轮次识别用，见 RoundState */
+  prompt_id?: string;
   cwd?: string;
   transcript_path?: string;
   // Stop

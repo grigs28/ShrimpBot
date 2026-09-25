@@ -163,6 +163,8 @@ SDK 路径目前是 MVP 状态，已知缺口：
 
 在非 clone 模式下，`doFinalPatch()` **优先用 `fallbackPtyText`**（`OutputParser` 产出、保证是本轮内容），transcript 文件仅作 fallback（其中可能残留中间 Stop 的过期数据）。
 
+**轮次识别（改 hook/轮次逻辑别绕开）**：轮次状态复位统一走 `beginRound()`（历史上散落在 `dispatchToClaude`/`handleExternalCommand` 两处的重复，已合并）。不经输入路径发起的轮次（会话内 cron 计划任务）由 `RoundState`（`src/pty/round-state.ts`）识别：Stop/Notification/PostToolUse/PostToolUseFailure 携带逐轮变化的 `prompt_id`，"无轮次进行中 + id 变化" → `onExternalRoundBegin()` 走同一入口开轮。`claudeBusy` 是轮次进行中的唯一事实源；`SubagentStop` 与 `SessionStart` 不参与识别（前者可能迟到数分钟）。改任何"开始新一轮"的路径都必须调 `beginRound()`。
+
 ### A2 权限审批
 
 `pty-manager.ts` 已**去掉 `--dangerously-skip-permissions`**，claude 以 default 权限模式启动，于是 `PermissionRequest` hook 能被触发。`classify()` 决定每个工具的走向：
