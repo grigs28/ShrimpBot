@@ -58,6 +58,8 @@ export class PTYManager {
   private restartCount = 0;
   private readonly MAX_RESTARTS = 5;
   private readonly RESTART_WINDOW_MS = 60000;
+  /** 多行提交时，文本写完到单独写回车之间的间隔（躲开 TUI 的粘贴判定窗口） */
+  private static readonly SUBMIT_DELAY_MS = 80;
   private restartHistory: number[] = [];
 
   constructor(private options: PTYOptions = {}) {
@@ -140,16 +142,23 @@ export class PTYManager {
       throw new Error('PTY not running');
     }
     this.parser.markNewRound();
-    this.pty.write(message + '\r');
-    logger.info(this.tag, `← 发送: "${message.slice(0, 100)}"`);
-  }
 
-  /** 重置 parser 并写入文本（不带 \r），回车由调用方延迟单独发送 */
-  resetAndWrite(text: string): void {
-    if (!this.pty || !this.running) return;
-    this.parser.markNewRound();
-    this.pty.write(text);
-    logger.info(this.tag, `← 写入文本: "${text.slice(0, 100)}"`);
+    if (!message.includes('\n')) {
+      this.pty.write(message + '\r');
+      logger.info(this.tag, `← 发送: "${message.slice(0, 100)}"`);
+      return;
+    }
+
+    // 多行：文本与回车必须分两次写。合在一次 write 里会被 claude TUI 判定为
+    // "粘贴"——粘贴语义是插入字面文本，结尾的 \r 一并成为内容而不触发提交，
+    // 消息就停在输入框里，需要人工回车。单独一次写 \r 在字节层等同于用户按 Enter。
+    this.pty.write(message);
+    logger.info(this.tag, `← 发送(多行 ${message.length}字): "${message.slice(0, 100)}"`);
+    setTimeout(() => {
+      if (!this.running || !this.pty) return;
+      this.pty.write('\r');
+      logger.info(this.tag, '← 发送: 回车（多行提交）');
+    }, PTYManager.SUBMIT_DELAY_MS);
   }
 
   onEvent(listener: (event: PTYEvent) => void): void {

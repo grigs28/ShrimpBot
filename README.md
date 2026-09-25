@@ -177,6 +177,24 @@ claude 调工具 → PermissionRequest hook(http) POST hub /api/hook/approval?bo
 
 > ⚠️ **SDK 模式（`SDK_EVENT_MODE=true`）尚未接入 A2**：其 `onApproval` 目前无条件 allow。PTY/SDK 两路径审批语义待统一。
 
+## 消息投递 / Message Delivery
+
+飞书消息投递进 claude TUI 有两条容易踩的坑，已处理：
+
+**1. 多行消息：文本与回车分两次写**
+
+把 `文本 + \r` 合成**一次**写入，会被 claude TUI 判定为**粘贴**——粘贴语义是插入字面文本，结尾的 `\r` 一并成为内容而**不触发提交**，消息就停在输入框里，得人工回车。
+
+所以 `PTYManager.send()` 对含换行的文本分两段写：先写文本（不含 `\r`），80ms 后**单独**写一次 `\r`（单独一次写在字节层等同于用户按 Enter）。单行消息保持原样一次写入，行为不变。
+
+> 终端里手动粘贴走的是终端自己的 bracketed paste（`ESC[200~ … ESC[201~`），桥接层**原样透传不动**——剥掉标记会让粘贴内容里的换行全部变成有效提交，一次性执行一串垃圾命令。
+
+**2. 启动期消息：等 TUI 就绪再投递**
+
+bot 刚启动、`claude -c` 还在恢复会话时，TUI 尚未就绪，此时写入的 `\r` 会被初始化流程吞掉。
+
+`ReadyGate` 在 `❯` 出现前挡住新消息投递，就绪后再写；**超时 30s fail-open 照常投递**（绝不挂住消息，超时会打 warn 日志）。门闸**只用于新消息派发**（飞书消息、`--command` 首条命令）——A2 的 AskUserQuestion 回答和 yes/no 回答**不能**过门闸，那时 claude 正停在 TUI 里、根本不显示 `❯`，会白等到超时。
+
 ## 架构 / Architecture
 
 ```

@@ -10,6 +10,7 @@ import type { FeishuEvent, HookEvent } from '../types/index.js';
 import { SDKSession } from '../sdk/sdk-session.js';
 import { FeishuCardRenderer } from '../sdk/feishu-card-renderer.js';
 import type { SDKBridgeEvent, ApprovalRequest, PermissionResult } from '../sdk/sdk-types.js';
+import { ReadyGate, deliverWhenReady } from './readiness-gate.js';
 
 export interface BridgeConfig {
   feishuAppId: string;
@@ -56,6 +57,10 @@ export class FeishuBridge {
   private permissionNotified = false;
   /** PTY ❯ 已出现（Claude 空闲），等待 Stop hook 带 transcript 完成卡片 */
   private ptyReady = false;
+  /** 投递门闸：TUI 未就绪时盲写会丢 \r，见 deliverWhenReady */
+  private readyGate = new ReadyGate();
+  /** 等 TUI 就绪的最长时间；超时 fail-open 照常投递，绝不挂住消息 */
+  private static readonly READY_TIMEOUT_MS = 30_000;
   /** PTY 完成时的兜底内容（Hook Stop 未触发时使用） */
   private fallbackPtyText = '';
   /** 最后一次 Hook Stop 传入的 transcript_path */
@@ -360,7 +365,7 @@ export class FeishuBridge {
   }
 
   sendInitialCommand(command: string): void {
-    this.sendToPty(command);
+    void this.deliverText(command);
   }
 
   // ========== 飞书 → Claude ==========
@@ -630,7 +635,7 @@ export class FeishuBridge {
       this.sendThinkingCard(event.chatId);
     }
 
-    this.sendToPty(text);
+    void this.deliverText(text);
 
     // 安全超时：120 秒无完成响应则强制解除阻塞
     if (this.busyTimer) clearTimeout(this.busyTimer);
@@ -656,6 +661,31 @@ export class FeishuBridge {
    */
   private sendToPty(text: string): void {
     this.pty.send(text);
+  }
+
+  /**
+   * 等 TUI 就绪后再投递"新消息"。
+   *
+   * 启动/恢复会话期间 TUI 尚未就绪，此时盲写的 \r 会被初始化流程吞掉，
+   * 消息停在输入框里、要人工回车才提交。所以先等 ❯ 出现；超时 fail-open 照常投递。
+   *
+   * 注意：**只用于新消息派发**（飞书消息、--command 首条命令）。
+   * 不要包到 A2 的 AskUserQuestion 回答 / yes-no 回答上——那时 claude 正停在 TUI 里、
+   * 根本不显示 ❯，门闸会白等到超时才放行。
+   */
+  private async deliverText(text: string): Promise<void> {
+    try {
+      const ready = await deliverWhenReady(
+        this.readyGate,
+        () => this.sendToPty(text),
+        FeishuBridge.READY_TIMEOUT_MS,
+      );
+      if (!ready) {
+        logger.warn(this.tag, `等待 PTY 就绪超时(${FeishuBridge.READY_TIMEOUT_MS}ms)，已强制投递`);
+      }
+    } catch (err) {
+      logger.error(this.tag, `投递失败: ${(err as Error).message}`);
+    }
   }
 
   /** 终端/Web 输入提交命令 → 开始新一轮（三端同步） */
@@ -856,6 +886,7 @@ export class FeishuBridge {
       }
       // 普通 ❯：标记 PTY 就绪，等 Stop hook 带 transcript 完成卡片
       this.ptyReady = true;
+      this.readyGate.markReady();
       this.fallbackPtyText = fullText;
       logger.info(this.tag, `PTY ❯ 就绪 (${fullText.length}字), 等 Stop hook`);
       // 如果 Stop 已经先到了（已有 transcript），立即完成
