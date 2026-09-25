@@ -12,6 +12,7 @@ import { FeishuCardRenderer } from '../sdk/feishu-card-renderer.js';
 import type { SDKBridgeEvent, ApprovalRequest, PermissionResult } from '../sdk/sdk-types.js';
 import { ReadyGate, deliverWhenReady } from './readiness-gate.js';
 import { RoundState } from './round-state.js';
+import { cardTagPrefix } from './card-tag.js';
 
 export interface BridgeConfig {
   feishuAppId: string;
@@ -62,6 +63,8 @@ export class FeishuBridge {
   private readyGate = new ReadyGate();
   /** 轮次识别：hook prompt_id 识别不经输入路径发起的轮次（cron 计划任务），见 beginRound/onExternalRoundBegin */
   private rounds = new RoundState();
+  /** 卡片标题的 [目录名] 前缀（多咪并行时标识项目），构造时算一次 */
+  private readonly cardTag: string;
   /** 等 TUI 就绪的最长时间；超时 fail-open 照常投递，绝不挂住消息 */
   private static readonly READY_TIMEOUT_MS = 30_000;
   /** PTY 完成时的兜底内容（Hook Stop 未触发时使用） */
@@ -140,6 +143,8 @@ export class FeishuBridge {
   constructor(config: BridgeConfig) {
     this.config = config;
     this.tag = `Bridge:${config.botName || 'default'}`;
+    // 卡片标题的 [目录名] 前缀（多咪并行时标识项目），见 buildCard
+    this.cardTag = cardTagPrefix(config.claudeCwd);
     this.feishuService = new lark.Client({
       appId: config.feishuAppId,
       appSecret: config.feishuAppSecret,
@@ -1088,7 +1093,8 @@ export class FeishuBridge {
       config: { wide_screen_mode: true },
       header: {
         template: color,
-        title: { content: title, tag: 'plain_text' },
+        // [目录名] 前缀标识项目（如 "[loging] 🟢 完成"），空前缀时标题原样
+        title: { content: this.cardTag + title, tag: 'plain_text' },
       },
       elements: [] as Record<string, unknown>[],
     };

@@ -211,6 +211,7 @@ SDK 路径另有 `HIGH_RISK_TOOLS` 硬黑名单（`rm` / `sudo` / `dd` / `mkfs` 
 
 ### 命令面板 / 多咪
 
+- 飞书卡片标题带 `[目录名]` 前缀（如 `[loging] 🟢 完成`）：`buildCard()` 单点拼接，前缀来自 `cardTagPrefix()`（`src/pty/card-tag.ts`，取 `CLAUDE_CWD` 末段）——SDK 路径自动跟进；纯文本出口（clone 模式）不带。
 - 命令存储：`~/.shrimpbot/commands/{botName}.json`，结构 `[{label, command}]`。Web UI 右下角浮层支持勾选批量发送、快速添加、导入/导出 JSON。API：`GET/POST/DELETE /api/commands/:botName` + `/export` + `/import`。
 - 多咪：`sbot init` 注册 bot 到 `bots.json`；每个项目的 `.sbot` 用 `FEISHU_BOT_NAME=<name>` 绑定，因此多个终端可同时跑不同 bot。
 - 新群聊/私聊自动发现并写回该 bot 的 `chatIds`。消息按 bot 排队，`claudeBusy` 防止并发调用 Claude。

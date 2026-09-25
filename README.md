@@ -241,6 +241,8 @@ Docker web-server (:5554, 仅 Web UI + Hook API，含 /api/hook/approval 端点)
 
 `sbot init` 选择要用的那只咪，写入 `~/.shrimpbot/config.json`。
 
+所有飞书卡片标题带 **[目录名] 前缀**（如 `[loging] 🟢 完成`、`[pve] 🟡 请选择`），多咪并行时一眼区分项目；取自 `CLAUDE_CWD` 末段，与 Web 端 tab（`Log咪 (loging)`）同款。纯文本消息（clone 模式）不带。
+
 ## systemd 服务
 
 ```bash
